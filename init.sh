@@ -78,18 +78,25 @@ if [[ "$(id -u)" -eq 0 ]]; then
   # Под root доступен ровно один шаг — всё остальное делается от имени dev.
   if done_server; then
     echo "${C_OK}✔ Шаг 1 уже выполнен.${C_RST}"
-    echo
-    echo "Дальше — под пользователем '$DEV_USER':"
-    echo "      ssh $DEV_USER@<IP>"
-    echo "      cd ~/vps && bash init.sh"
-    exit 0
+  else
+    echo "${C_INFO}▶ Шаг 1: настройка сервера${C_RST}"
+    bash setup-server.sh
   fi
-  echo "${C_INFO}▶ Шаг 1: настройка сервера${C_RST}"
-  bash setup-server.sh
+
+  # Репозиторий должен оказаться у dev: это и рабочая папка управляющей сессии,
+  # и источник всех дальнейших шагов. Под root он обычно лежит в /root.
+  DEST="/home/$DEV_USER/vps"
+  if [[ "$PWD" != "$DEST" ]]; then
+    echo
+    echo "${C_INFO}▶ Копирую репозиторий в $DEST${C_RST}"
+    install -d -o "$DEV_USER" -g "$DEV_USER" "$DEST"
+    cp -r ./. "$DEST/"
+    chown -R "$DEV_USER:$DEV_USER" "$DEST"
+    echo "${C_OK}✔ Готово.${C_RST}"
+  fi
+
   echo
-  echo "${C_OK}✔ Шаг 1 готов.${C_RST} Скопируй репозиторий пользователю и перезайди:"
-  echo
-  echo "      cp -r \"$PWD\" /home/$DEV_USER/vps && chown -R $DEV_USER:$DEV_USER /home/$DEV_USER/vps"
+  echo "Дальше — под пользователем '$DEV_USER':"
   echo "      ssh $DEV_USER@<IP>"
   echo "      cd ~/vps && bash init.sh"
   exit 0
