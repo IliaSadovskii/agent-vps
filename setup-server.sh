@@ -479,7 +479,7 @@ main() {
 
   # --- Пакеты ---
   say "Ставлю базовые пакеты…"
-  apt-get install -y curl ca-certificates git tmux htop tree acl \
+  apt-get install -y curl ca-certificates git tmux htop tree acl jq \
        build-essential python3 python3-pip fail2ban ufw unzip gh
   ok "Пакеты на месте."
 
@@ -521,6 +521,43 @@ main() {
     fi
   '
   ok "Claude Code готов, bypass-режим включён."
+
+  # --- Запреты, которые переживают bypass ---
+  # Агенты работают в bypass-режиме: разрешения не спрашиваются. Это осознанно —
+  # ради автономности. Но deny-правила действуют ДАЖЕ в bypass (проверено), и
+  # сюда вынесено ровно то, что может отрезать владельца от собственного сервера.
+  #
+  # Это защита от аварии, а не от злоумышленника: агент, которому нужно обойти
+  # запрет, обойдёт его другим инструментом. Смысл в другом — случайная правка
+  # sshd_config или `ufw disable` посреди длинной задачи больше не превратится
+  # в потерю доступа к машине.
+  #
+  # Заметь, чего в списке НЕТ: правки этих же файлов из setup-server.sh. Скрипт
+  # запускается как bash-программа, а не инструментом Edit, и под запрет не
+  # попадает. Ровно то поведение, которое нужно: настройки сервера меняются
+  # через репозиторий, а не разовым редактированием файла в /etc.
+  say "Прописываю запреты на необратимое (действуют и в bypass-режиме)…"
+  local claude_settings="/home/$DEV_USER/.claude/settings.json"
+  local deny_rules='[
+    "Edit(//etc/ssh/**)",
+    "Write(//etc/ssh/**)",
+    "Edit(~/.ssh/**)",
+    "Write(~/.ssh/**)",
+    "Bash(sudo ufw disable*)",
+    "Bash(sudo ufw --force reset*)",
+    "Bash(sudo systemctl stop ssh*)",
+    "Bash(sudo systemctl disable ssh*)",
+    "Bash(sudo passwd*)"
+  ]'
+  # Слияние, а не перезапись: в файле лежат личные настройки (тема, режим TUI).
+  # unique сохраняет идемпотентность — повторный запуск не плодит дубли.
+  local merged
+  merged="$(jq --argjson deny "$deny_rules" \
+    '.permissions //= {} | .permissions.deny = ((.permissions.deny // []) + $deny | unique)' \
+    "$claude_settings")" || die "Не смог разобрать $claude_settings — не трогаю его."
+  printf '%s\n' "$merged" > "$claude_settings"
+  chown "$DEV_USER:$DEV_USER" "$claude_settings"
+  ok "Запреты прописаны ($(printf '%s' "$merged" | jq '.permissions.deny | length') правил)."
 
   # --- Механизм параллельных сессий ---
   say "Устанавливаю механизм параллельных сессий (claude-new/list/kill + скилл)…"
