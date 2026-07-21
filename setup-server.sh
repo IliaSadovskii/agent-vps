@@ -538,22 +538,27 @@ main() {
   # через репозиторий, а не разовым редактированием файла в /etc.
   say "Прописываю запреты на необратимое (действуют и в bypass-режиме)…"
   local claude_settings="/home/$DEV_USER/.claude/settings.json"
+  # Только Edit(...) — Write(...) в проверках путей не участвует, о чём Claude
+  # Code честно предупреждает при запуске. Edit покрывает все инструменты,
+  # которые пишут в файл, так что отдельное правило для Write не нужно и лишь
+  # создаёт видимость защиты.
   local deny_rules='[
     "Edit(//etc/ssh/**)",
-    "Write(//etc/ssh/**)",
     "Edit(~/.ssh/**)",
-    "Write(~/.ssh/**)",
     "Bash(sudo ufw disable*)",
     "Bash(sudo ufw --force reset*)",
     "Bash(sudo systemctl stop ssh*)",
     "Bash(sudo systemctl disable ssh*)",
     "Bash(sudo passwd*)"
   ]'
+  # Правила, которые платформа ставила раньше и признала негодными. Без явного
+  # вычитания они остались бы в settings.json навсегда: слияние только добавляет.
+  local obsolete_rules='["Write(//etc/ssh/**)", "Write(~/.ssh/**)"]'
   # Слияние, а не перезапись: в файле лежат личные настройки (тема, режим TUI).
   # unique сохраняет идемпотентность — повторный запуск не плодит дубли.
   local merged
-  merged="$(jq --argjson deny "$deny_rules" \
-    '.permissions //= {} | .permissions.deny = ((.permissions.deny // []) + $deny | unique)' \
+  merged="$(jq --argjson deny "$deny_rules" --argjson obsolete "$obsolete_rules" \
+    '.permissions //= {} | .permissions.deny = (((.permissions.deny // []) - $obsolete) + $deny | unique)' \
     "$claude_settings")" || die "Не смог разобрать $claude_settings — не трогаю его."
   printf '%s\n' "$merged" > "$claude_settings"
   chown "$DEV_USER:$DEV_USER" "$claude_settings"
