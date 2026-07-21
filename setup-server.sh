@@ -118,6 +118,15 @@ if ! [[ "$NAME" =~ ^[A-Za-z0-9-]+$ ]]; then
   echo "Имя может содержать только буквы, цифры и дефис." >&2
   exit 1
 fi
+# Ссылку тоже проверяем, а не только имя. git понимает транспорты вида
+# `ext::<команда>`, и такой URL — это выполнение произвольной команды на
+# сервере в момент clone. Пускаем ровно два безопасных формата.
+if [[ -n "$REPO_URL" ]] \
+   && ! [[ "$REPO_URL" =~ ^https://[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+$ ]] \
+   && ! [[ "$REPO_URL" =~ ^git@[A-Za-z0-9._-]+:[A-Za-z0-9._/-]+$ ]]; then
+  echo "Ссылка должна быть https://host/owner/repo или git@host:owner/repo." >&2
+  exit 1
+fi
 PROJ_PATH="$PROJECTS_DIR/$NAME"
 if tmux has-session -t "ccp-$NAME" 2>/dev/null; then
   echo "Проект '$NAME' уже открыт (proj-$NAME). Переключись на него в приложении."
@@ -574,23 +583,21 @@ EOF
   fi
 
   # --- SSH hardening (с самопроверкой) ---
-  if [[ -f /etc/ssh/sshd_config.d/99-hardening.conf ]]; then
-    skip "SSH hardening"
-  else
-    say "Проверяю готовность dev перед закрытием root-доступа…"
-    [[ -s "/home/$DEV_USER/.ssh/authorized_keys" ]] || die "У dev нет ключа — НЕ закрываю root."
-    runuser -l "$DEV_USER" -c 'sudo -n true' 2>/dev/null || die "sudo под dev не работает — НЕ закрываю root."
-    ok "dev готов."
-
-    say "Хардинг SSH…"
-    cat > /etc/ssh/sshd_config.d/99-hardening.conf <<'EOF'
+  local ssh_conf=/etc/ssh/sshd_config.d/99-hardening.conf
+  local ssh_tmp
+  ssh_tmp="$(mktemp)"
+  cat > "$ssh_tmp" <<EOF
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
-# prohibit-password: root пускается ПО КЛЮЧУ, но не по паролю. Позволяет
-# заходить под root (напр. для SFTP к файлам в корне), сохраняя защиту —
-# пароль всё равно отключён, брутфорс невозможен.
-PermitRootLogin prohibit-password
+# Вход под root закрыт полностью. Раньше здесь было prohibit-password (root по
+# ключу, без пароля) ради SFTP к файлам в корне — но у $DEV_USER есть NOPASSWD
+# sudo, так что отдельный root-вход ничего не даёт, зато держит вторую живую
+# точку входа с правами суперпользователя. Для файлов в корне: sudo из-под dev.
+PermitRootLogin no
+# Белый список: любая будущая системная учётка, которой кто-то положит ключ,
+# не получит вход автоматически. Пускаем ровно того, кто нужен.
+AllowUsers $DEV_USER
 PermitEmptyPasswords no
 # 6, а не 4 — запас, если ssh-агент перебирает несколько ключей перед нужным.
 MaxAuthTries 6
@@ -600,10 +607,22 @@ ClientAliveCountMax 2
 X11Forwarding no
 UseDNS no
 EOF
-    chmod 600 /etc/ssh/sshd_config.d/99-hardening.conf
+  if [[ -f "$ssh_conf" ]] && cmp -s "$ssh_tmp" "$ssh_conf"; then
+    skip "SSH hardening"
+    rm -f "$ssh_tmp"
+  else
+    say "Проверяю готовность $DEV_USER перед закрытием root-доступа…"
+    [[ -s "/home/$DEV_USER/.ssh/authorized_keys" ]] || die "У $DEV_USER нет ключа — НЕ закрываю root."
+    runuser -l "$DEV_USER" -c 'sudo -n true' 2>/dev/null || die "sudo под $DEV_USER не работает — НЕ закрываю root."
+    ok "$DEV_USER готов."
+
+    say "Хардинг SSH…"
+    install -m 600 "$ssh_tmp" "$ssh_conf"
+    rm -f "$ssh_tmp"
+    # Проверяем ДО рестарта: битый конфиг оставил бы сервер без sshd.
     sshd -t || die "Конфиг SSH невалиден — НЕ рестартую."
     systemctl restart ssh || systemctl restart sshd
-    ok "SSH захардирован."
+    ok "SSH захардирован (вход только под $DEV_USER по ключу)."
   fi
 
   echo

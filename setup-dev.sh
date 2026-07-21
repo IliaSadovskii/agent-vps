@@ -61,18 +61,41 @@ https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_C
   # Пишем ДО установки движка: тогда dockerd стартует уже с безопасными
   # настройками и не успевает открыть наружу ни одного порта.
   #
-  #   "ip": "127.0.0.1"  — САМОЕ ВАЖНОЕ. Docker пишет правила прямо в iptables
-  #   ДО цепочек UFW, поэтому `ports: "5432:5432"` в любом compose открыл бы
-  #   базу всему интернету, несмотря на `ufw default deny incoming`. Этот
-  #   параметр меняет адрес публикации по умолчанию: порт физически не слушает
-  #   внешние интерфейсы. В отличие от правок iptables — ломаться нечему.
+  #   Публикация портов только на localhost — САМОЕ ВАЖНОЕ. Docker пишет правила
+  #   прямо в iptables ДО цепочек UFW, поэтому `ports: "5432:5432"` в любом
+  #   compose открыл бы базу всему интернету, несмотря на `ufw default deny
+  #   incoming`. Ниже порт физически не слушает внешние интерфейсы.
   #   Доступ снаружи даёт tailscale (см. step_tailscale).
+  #
+  #   Ключей ДВА, и одного мало:
+  #     "ip" — действует ТОЛЬКО на дефолтный bridge (docker0). На сети, которые
+  #       создаёт docker compose (br-*), он не влияет вообще. Проверено на
+  #       Docker 29: `docker run -p` слушает 127.0.0.1, а `docker compose up`
+  #       того же образа — 0.0.0.0. То есть для реальных проектов, а их сети
+  #       всегда пользовательские, одного "ip" не хватает.
+  #     "default-network-opts" — задаёт host_binding_ipv4 по умолчанию для
+  #       КАЖДОЙ создаваемой bridge-сети, включая compose-сети. Это и есть
+  #       рабочая защита; "ip" оставлен для docker run без сети.
+  #   Требует Docker >= 28. Проверяется через `dockerd --validate` ниже.
   #
   #   log-opts — без ротации логи контейнеров растут безгранично и за пару
   #   месяцев съедают диск. Классическая беда долгоживущих dev-серверов.
   local daemon_json="/etc/docker/daemon.json"
-  if [[ -f "$daemon_json" ]] && grep -q '"ip"[[:space:]]*:[[:space:]]*"127.0.0.1"' "$daemon_json"; then
+  local daemon_tmp
+  daemon_tmp="$(mktemp)"
+  cat > "$daemon_tmp" <<'JSON'
+{
+  "ip": "127.0.0.1",
+  "default-network-opts": {
+    "bridge": { "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1" }
+  },
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
+JSON
+  if [[ -f "$daemon_json" ]] && sudo cmp -s "$daemon_tmp" "$daemon_json"; then
     skip "daemon.json (bind на 127.0.0.1 уже настроен)"
+    rm -f "$daemon_tmp"
   else
     if [[ -f "$daemon_json" ]]; then
       warn "daemon.json уже есть и отличается — сохраняю копию в ${daemon_json}.bak"
@@ -80,14 +103,29 @@ https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_C
     fi
     say "Пишу $daemon_json…"
     sudo install -d -m 755 /etc/docker
-    sudo tee "$daemon_json" >/dev/null <<'JSON'
-{
-  "ip": "127.0.0.1",
-  "log-driver": "json-file",
-  "log-opts": { "max-size": "10m", "max-file": "3" }
-}
-JSON
+    sudo install -m 644 "$daemon_tmp" "$daemon_json"
+    rm -f "$daemon_tmp"
     ok "daemon.json записан (порты публикуются только на localhost)."
+    # Если движок уже стоит и крутится, новый конфиг сам собой не применится —
+    # dockerd читает daemon.json только при старте. На чистой машине этой ветки
+    # не будет: файл пишется до установки движка.
+    if command -v dockerd &>/dev/null && systemctl is-active --quiet docker; then
+      sudo dockerd --validate --config-file "$daemon_json" >/dev/null \
+        || die "daemon.json не принят dockerd — не рестартую, чтобы не уронить движок."
+      say "Перезапускаю docker, чтобы конфиг применился…"
+      sudo systemctl restart docker
+      ok "Docker перезапущен."
+      # Уже запущенные контейнеры сохранили старую привязку портов: адрес
+      # выбирается в момент старта контейнера, а не демона. Пересоздать их
+      # может только владелец проекта — молча трогать чужие данные нельзя.
+      local stale
+      stale="$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | grep -F '0.0.0.0:' | cut -f1 || true)"
+      if [[ -n "$stale" ]]; then
+        warn "Эти контейнеры всё ещё слушают 0.0.0.0 — пересоздай их"
+        warn "(docker compose up -d --force-recreate) в каталоге проекта:"
+        printf '        %s\n' $stale
+      fi
+    fi
   fi
 
   # --- Движок ---
