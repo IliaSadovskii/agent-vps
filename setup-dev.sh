@@ -483,6 +483,129 @@ step_ports() {
 }
 
 # ============================================================================
+#  АВТОПУЛ — изменения, запушенные с других машин, приезжают сами
+# ============================================================================
+# Код правится в трёх местах: на ноутбуке владельца, здесь агентом и изредка
+# прямо на GitHub. Без автопула сервер молча отстаёт, и расхождение обнаруживает
+# себя в самый неудобный момент.
+#
+# Опрос по таймеру, а не webhook: webhook требует входящего HTTP, то есть либо
+# открытого порта, либо tailscale funnel. Отдавать наружу вход ради удобства
+# деплоя — плохой размен, весь смысл настройки firewall в обратном. `git fetch`
+# на таком репозитории стоит один запрос и пару килобайт; раз в две минуты
+# сервер этого не замечает.
+step_autopull() {
+  echo; say "═══ Автопул проектов ═══"
+
+  local bin="$HOME/.local/bin/projects-pull"
+  install -d -m 755 "$HOME/.local/bin"
+  cat > "$bin" <<'PULLSH'
+#!/usr/bin/env bash
+# Подтягивает в проекты изменения, запушенные с других машин.
+# Ставится setup-dev.sh, руками не правится.
+#
+# Главный принцип: НИКОГДА не трогать работу, которая идёт прямо сейчас.
+# Поэтому только --ff-only (он не мержит и ничего не перезаписывает: либо
+# перемотка начисто, либо отказ) и пропуск всего, что выглядит занятым.
+set -uo pipefail
+
+PROJECTS_DIR="/projects"
+LOG="$HOME/.local/state/projects-pull.log"
+mkdir -p "$(dirname "$LOG")"
+
+log() { printf '%s  %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+
+shopt -s nullglob
+for repo in "$PROJECTS_DIR"/*/; do
+  [[ -d "$repo/.git" ]] || continue
+  name="$(basename "$repo")"
+  cd "$repo" || continue
+
+  # Не main — значит идёт работа в ветке. Это нормально, молчим.
+  branch="$(git symbolic-ref --short -q HEAD || true)"
+  [[ "$branch" == "main" ]] || continue
+
+  # Незаконченный мерж или ребейз — вмешиваться нельзя.
+  [[ -d .git/rebase-merge || -d .git/rebase-apply || -f .git/MERGE_HEAD ]] && continue
+
+  # Незакоммиченные правки: кто-то (человек или агент) сейчас работает.
+  # Молча ждём следующего запуска — файл из-под редактирования не уедет.
+  [[ -z "$(git status --porcelain)" ]] || continue
+
+  timeout 60 git fetch --quiet origin 2>/dev/null || { log "$name: fetch не удался"; continue; }
+
+  before="$(git rev-parse HEAD)"
+  after="$(git rev-parse origin/main 2>/dev/null)" || continue
+  [[ "$before" != "$after" ]] || continue   # уже актуально — не шумим в журнал
+
+  # Локальные коммиты, которых нет на GitHub. Перемотка невозможна, и это ровно
+  # тот случай, когда автопул тихо встаёт навсегда — поэтому пишем в журнал.
+  if ! git merge-base --is-ancestor "$before" "$after"; then
+    log "$name: есть незапушенные локальные коммиты — автопул остановлен, нужен push"
+    continue
+  fi
+
+  changed="$(git diff --name-only "$before" "$after")"
+  if timeout 120 git merge --ff-only --quiet "$after" 2>/dev/null; then
+    log "$name: обновлён $(git rev-parse --short "$before") → $(git rev-parse --short "$after")"
+    # PHP интерпретируемый — правки кода действуют сразу. Перезапуск нужен
+    # только для этих случаев, и решает его человек, а не таймер.
+    grep -qE '(^|/)(composer\.lock|package-lock\.json|yarn\.lock|Dockerfile|docker-compose[^/]*\.yml)$' <<< "$changed" \
+      && log "$name:   \\_ изменились зависимости или сборка — нужен make up"
+    grep -qE '(^|/)database/migrations/' <<< "$changed" \
+      && log "$name:   \\_ новые миграции — нужен make up"
+    # .env в git нет, поэтому новая переменная приедет только как пример.
+    grep -qE '(^|/)\.env\.example$' <<< "$changed" \
+      && log "$name:   \\_ изменился .env.example — сверь свой .env, его git не переносит"
+  else
+    log "$name: перемотка не удалась"
+  fi
+done
+
+# Журнал не должен расти бесконечно.
+if [[ -f "$LOG" ]] && (( $(wc -l < "$LOG") > 500 )); then
+  tail -n 300 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi
+PULLSH
+  chmod 755 "$bin"
+  ok "Команда projects-pull установлена."
+
+  install -d -m 755 "$HOME/.config/systemd/user"
+  cat > "$HOME/.config/systemd/user/projects-pull.service" <<'UNIT'
+[Unit]
+Description=Подтянуть в проекты изменения из GitHub
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/projects-pull
+UNIT
+  cat > "$HOME/.config/systemd/user/projects-pull.timer" <<'UNIT'
+[Unit]
+Description=Проверять GitHub на изменения в проектах
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+# Таймеру не нужна точность до секунды; послабление позволяет systemd
+# группировать пробуждения и не дёргать процессор впустую.
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now projects-pull.timer >/dev/null 2>&1
+  if systemctl --user is-active --quiet projects-pull.timer; then
+    ok "Автопул включён: раз в 2 минуты, только main, только перемотка."
+    say "Журнал: ~/.local/state/projects-pull.log"
+  else
+    warn "Таймер автопула не запустился. Диагностика:"
+    echo "    systemctl --user status projects-pull.timer"
+  fi
+}
+
+# ============================================================================
 #  ПРАВИЛА ДЛЯ АГЕНТОВ
 # ============================================================================
 step_rules() {
@@ -516,6 +639,7 @@ main() {
   step_tailscale
   step_mise
   step_ports
+  step_autopull
   step_rules
 
   echo
