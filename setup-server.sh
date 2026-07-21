@@ -6,7 +6,7 @@
 # ============================================================================
 #
 #  ЗАПУСК 1 — под root, делает ВСЁ кроме автозапуска:
-#      bash vps-bootstrap.sh
+#      bash setup-server.sh
 #    · пользователь dev с NOPASSWD sudo + твой SSH-ключ
 #    · пакеты, Node.js, Claude Code
 #    · bypass-режим Claude, каталог /projects
@@ -16,7 +16,7 @@
 #  >>> потом вручную (в браузере) авторизуешь Claude <<<
 #
 #  ЗАПУСК 2 — под dev, автозапуск Remote Control:
-#      bash vps-bootstrap.sh --service
+#      bash setup-server.sh --service
 #
 #  Все шаги проверяют «уже сделано?» и пропускают — повторный запуск безопасен.
 #

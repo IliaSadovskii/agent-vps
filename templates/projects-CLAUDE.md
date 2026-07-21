@@ -1,4 +1,4 @@
-<!-- Создаётся автоматически из vps/templates/projects-CLAUDE.md. Правь там и запусти dev-env.sh. -->
+<!-- Создаётся автоматически из vps/templates/projects-CLAUDE.md. Правь там и запусти setup-dev.sh. -->
 
 # Правила этого сервера
 
