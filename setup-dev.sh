@@ -335,6 +335,59 @@ step_tailscale() {
 }
 
 # ============================================================================
+#  DOZZLE — веб-обзор docker-контейнеров (только просмотр)
+# ============================================================================
+step_dozzle() {
+  echo; say "═══ Dozzle ═══"
+
+  # Зачем: смотреть запущенные контейнеры и их логи из браузера, не заходя в
+  # терминал. Read-only обзор — docker-сокет монтируется :ro. Наружу не торчит:
+  # контейнер слушает только 127.0.0.1, доступ с твоих устройств даёт tailscale.
+  #
+  # Инфра-сервис сервера, а не проект: живёт здесь, а не в /projects. Порт берёт
+  # из инфра-диапазона 8060-8069 (проектные блоки — тоже 80xx, но раздаются
+  # руками и с ним не пересекаются), HTTPS в тайлнет отдаётся на :8444.
+  local name="vps-dozzle"
+  local image="amir20/dozzle:latest"   # монитор, не БД — плавающий тег допустим
+  local bind="127.0.0.1:8060"          # host → контейнерный 8080
+  local tsport="8444"                  # порт HTTPS в тайлнете (:8443 занят)
+
+  command -v docker &>/dev/null || { warn "Docker не установлен — пропускаю Dozzle."; return 0; }
+
+  # --- контейнер ---
+  # Пересоздаём только если не бежит: не трогаем чужие контейнеры и не рестартим
+  # докер (это уронило бы контейнеры проектов).
+  if [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" == "true" ]]; then
+    skip "Контейнер $name запущен"
+  else
+    say "Поднимаю $name…"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker run -d --name "$name" --restart unless-stopped \
+      -v /var/run/docker.sock:/var/run/docker.sock:ro \
+      -p "$bind:8080" \
+      "$image" >/dev/null
+    ok "Dozzle запущен на $bind (docker-сокет только для чтения)."
+  fi
+
+  # --- доступ через tailscale ---
+  if ! tailscale status &>/dev/null; then
+    warn "Tailscale не в сети — вход в Dozzle появится после 'sudo tailscale up'."
+    return 0
+  fi
+  if tailscale serve status 2>/dev/null | grep -q ":$tsport"; then
+    skip "Tailscale serve на :$tsport"
+  else
+    say "Отдаю Dozzle в тайлнет по HTTPS…"
+    sudo tailscale serve --bg --https="$tsport" "http://$bind" >/dev/null
+    ok "Отдан."
+  fi
+
+  local host
+  host="$(tailscale status --json | grep -m1 '"DNSName"' | cut -d'"' -f4 | sed 's/\.$//')"
+  say "Dozzle: https://$host:$tsport"
+}
+
+# ============================================================================
 #  MISE — менеджер версий тулчейнов
 # ============================================================================
 step_mise() {
@@ -637,6 +690,7 @@ main() {
   step_swap
   step_firewall
   step_tailscale
+  step_dozzle
   step_mise
   step_ports
   step_autopull
