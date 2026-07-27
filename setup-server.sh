@@ -109,15 +109,19 @@ REG_EOF
 
   # claude-new — ПОБОЧНАЯ сессия В ТЕКУЩЕЙ папке (наследует папку родителя).
   # Из vps-main (~/vps) → в ~/vps. Изнутри проекта → в папке проекта.
+  # Второй аргумент — явная папка (папку нельзя передать через cd: скрипт
+  # берёт её у tmux-панели родителя, а не из cwd вызывающей оболочки).
   cat > "$bin/claude-new" <<'HELPER_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 NAME="${1:-}"
+DIR_ARG="${2:-}"
 OPS_DIR="$HOME/vps"
 CLAUDE_BIN="$HOME/.local/bin/claude"
 if [[ -z "$NAME" ]]; then
-  echo "Использование: claude-new <имя>" >&2
+  echo "Использование: claude-new <имя> [папка]" >&2
   echo "Пример:        claude-new debug" >&2
+  echo "Пример:        claude-new kit-2 /projects/agent-kit" >&2
   exit 1
 fi
 if ! [[ "$NAME" =~ ^[A-Za-z0-9-]+$ ]]; then
@@ -129,8 +133,14 @@ if tmux has-session -t "cc-$NAME" 2>/dev/null || tmux has-session -t "ccp-$NAME"
   echo "Имя '$NAME' уже занято другой сессией. Выбери другое."
   exit 0
 fi
-# наследуем текущую папку (внутри tmux) или ops по умолчанию
-if [[ -n "${TMUX:-}" ]]; then
+# папка: явный аргумент → папка родительской панели (внутри tmux) → ops
+if [[ -n "$DIR_ARG" ]]; then
+  if [[ ! -d "$DIR_ARG" ]]; then
+    echo "Папки '$DIR_ARG' нет." >&2
+    exit 1
+  fi
+  WORKDIR="$(cd "$DIR_ARG" && pwd)"
+elif [[ -n "${TMUX:-}" ]]; then
   WORKDIR="$(tmux display-message -p '#{pane_current_path}')"
 else
   WORKDIR="$OPS_DIR"
@@ -571,10 +581,13 @@ RESTORE_EOF
 name: vps-new
 description: Создать новую ПОБОЧНУЮ Claude-сессию на этом VPS в текущей папке. Используй, когда пользователь просит создать новую или параллельную сессию, поработать над задачей отдельно ("создай сессию для X", "новая сессия под отладку", "хочу параллельно заняться Y"). Слэш-команда /vps-new.
 ---
-Создай побочную сессию командой `claude-new <имя>`.
+Создай побочную сессию командой `claude-new <имя> [папка]`.
 1. Определи короткое латинское имя из запроса (отладка→debug, платежи→payments). Если пользователь назвал — используй его.
 2. Выполни `claude-new <имя>`. Сессия появится в приложении как `vps-<имя>` в текущей папке.
 3. Сообщи, что сессия создана и видна в приложении (раздел Code).
+Если просят вторую (параллельную) сессию для уже открытого проекта — передай папку
+вторым аргументом: `claude-new <имя> /projects/<проект>`. Через `cd` папку задать
+нельзя: без аргумента команда берёт папку tmux-панели родителя, а не cwd оболочки.
 НЕ создавай сессию, если пользователь просто хочет очистить контекст — для этого /clear.
 S_EOF
 
@@ -1127,6 +1140,15 @@ case "${1:-}" in
       exit 1
     fi
     setup_service
+    ;;
+  --sessions)
+    # Только перевыложить команды сессий (claude-new и соседи) — быстрый путь,
+    # когда поменялись именно они, а трогать пакеты и хардинг незачем.
+    if [[ "$(id -u)" -ne 0 ]]; then
+      warn "Режим --sessions требует root:  ${C_INFO}sudo bash $0 --sessions${C_RST}"
+      exit 1
+    fi
+    install_parallel_sessions
     ;;
   -h|--help|help)
     show_help
