@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# ports — единый учёт портов проектов на этом VPS.
+#
+# Исходник — bin/ports в репозитории vps; в ~/.local/bin ставит setup-dev.sh.
+# Реестр руками не правь: пользуйся `ports claim`.
+#
+# МОДЕЛЬ. Каждому проекту — блок из 10 портов (80X0..80X9). Реестр — файлы
+# ports/<имя>.env в репозитории (в git, чтобы пережить переезд). Источник правды
+# о занятости — реестр ПЛЮС реально слушающие порты: так застолбим и то, что
+# кто-то поднял мимо реестра, и новый проект на это не наткнётся.
+#
+# Здесь речь только про host-порты 80xx, которые docker публикует на 127.0.0.1.
+# В tailnet эти же веб-сервисы выводит ports-web на том же номере порта (и рисует
+# дашборд :8062) — отдельного диапазона для tailnet больше нет.
+set -uo pipefail
+
+PORTS_DIR="${PORTS_DIR:-$HOME/vps/ports}"
+PROJECTS_DIR="/projects"
+
+# Диапазон раздачи и заповедники.
+LO=8010                            # ниже не раздаём: 8000-8009 оставлено под ручное/системное
+HI=8990                            # верхняя база блока (последний блок 8990-8999)
+RESERVED_BASES=(8060)              # 8060-8069 — инфра-сервисы (dozzle, dbgate, …)
+RESERVED_NOTE="8060-8069 — инфра (dozzle 8060, dbgate 8061)"
+TAILNET_NOTE="в tailnet веб-сервисы отдаются на ТОМ ЖЕ номере порта (ports-web); дашборд со ссылками — :8062"
+
+c_r=$'\e[31m'; c_g=$'\e[32m'; c_y=$'\e[33m'; c_c=$'\e[36m'; c_d=$'\e[2m'; c_0=$'\e[0m'
+die(){ echo "${c_r}✗ $*${c_0}" >&2; exit 1; }
+
+mkdir -p "$PORTS_DIR"
+
+# ---------------------------------------------------------------- утилиты ----
+
+# минимальный порт в файле реестра → база его десятка (или пусто)
+file_base(){
+  local min
+  min="$(grep -hE '^[A-Za-z0-9_]+=[0-9]+$' "$1" 2>/dev/null | cut -d= -f2 | sort -n | head -1)"
+  [[ -n "$min" ]] && echo "$(( min / 10 * 10 ))"
+}
+
+# "<база> <имя>" для каждого файла реестра
+registry_bases(){
+  shopt -s nullglob
+  local f b
+  for f in "$PORTS_DIR"/*.env; do
+    b="$(file_base "$f")"; [[ -n "$b" ]] && echo "$b $(basename "$f" .env)"
+  done
+  shopt -u nullglob
+}
+
+# реально слушающие порты в 8000-8099 (только docker на 127.0.0.1). Слушателей
+# tailscaled на tailnet-адресе (это наши же serve-порты) не считаем — иначе
+# опубликованный в tailnet сервис задвоил бы свой же порт как «занятый».
+live_ports(){ ss -ltnH 2>/dev/null | grep -oE '127\.0\.0\.1:80[0-9][0-9]\b' | grep -oE '80[0-9][0-9]' | sort -un; }
+live_bases(){ live_ports | awk '{print int($1/10)*10}' | sort -un; }
+
+is_reserved(){ local b=$1 r; for r in "${RESERVED_BASES[@]}"; do [[ "$b" == "$r" ]] && return 0; done; return 1; }
+
+# ---------------------------------------------------------------- команды ----
+
+cmd_claim(){
+  local name="${1:-}"; [[ -n "$name" ]] || die "Использование: ports claim <имя-проекта>"
+  [[ "$name" =~ ^[A-Za-z0-9-]+$ ]] || die "Имя: только буквы, цифры и дефис."
+  exec 9>"$PORTS_DIR/.lock"; flock 9    # атомарность: два проекта не займут один блок
+
+  local f="$PORTS_DIR/$name.env" base
+  if [[ -f "$f" ]]; then
+    base="$(file_base "$f")"; base="${base:-?}"
+    echo "${c_g}✔ У '$name' уже есть блок ${base}-$((base+9)).${c_0} Порты бери только из него."
+    return 0
+  fi
+
+  # занятые базы = реестр ∪ живые ∪ заповедники
+  declare -A busy; local b nm
+  while read -r b nm; do [[ -n "$b" ]] && busy[$b]=1; done < <(registry_bases)
+  while read -r b;    do [[ -n "$b" ]] && busy[$b]=1; done < <(live_bases)
+  for b in "${RESERVED_BASES[@]}"; do busy[$b]=1; done
+
+  base=""
+  for (( b=LO; b<=HI; b+=10 )); do [[ -z "${busy[$b]:-}" ]] && { base=$b; break; }; done
+  [[ -n "$base" ]] || die "Свободных блоков в ${LO}-$((HI+9)) не осталось."
+
+  cat > "$f" <<EOF
+# $name — блок ${base}-$((base+9)) (застолблено: ports claim)
+# Все порты проекта берутся только из этого блока. Имена переменных диктует
+# docker-compose проекта — допиши сюда нужные, напр. APP_PORT=${base}, и
+# setup-dev.sh разольёт их в .env проекта.
+BASE_PORT=$base
+EOF
+  echo "${c_g}✔ Проекту '$name' закреплён блок ${base}-$((base+9)).${c_0}"
+  echo "Занимай порты ${base}..$((base+9)) — они гарантированно свободны и теперь видны как занятые."
+}
+
+cmd_free(){
+  local name="${1:-}"; [[ -n "$name" ]] || die "Использование: ports free <имя-проекта>"
+  exec 9>"$PORTS_DIR/.lock"; flock 9
+  local f="$PORTS_DIR/$name.env"
+  [[ -f "$f" ]] || die "У '$name' нет закреплённого блока."
+  local base; base="$(file_base "$f")"
+  local lp; lp="$(live_ports | awk -v b="${base:-0}" '$1>=b && $1<=b+9' | tr '\n' ' ')"
+  [[ -z "$lp" ]] || echo "${c_y}⚠ В блоке ${base}-$((base+9)) ещё кто-то слушает: $lp — сначала останови проект.${c_0}"
+  rm -f "$f"
+  echo "${c_g}✔ Блок проекта '$name' освобождён (файл реестра удалён).${c_0}"
+}
+
+cmd_which(){
+  local name="${1:-}"; [[ -n "$name" ]] || die "Использование: ports which <имя-проекта>"
+  local f="$PORTS_DIR/$name.env"
+  [[ -f "$f" ]] || die "У '$name' нет закреплённого блока (ports claim $name)."
+  local base; base="$(file_base "$f")"
+  echo "${base}-$((base+9))"
+}
+
+cmd_doctor(){
+  local problems=0
+
+  # 1) один порт в реестре у двух проектов
+  shopt -s nullglob; local files=( "$PORTS_DIR"/*.env ); shopt -u nullglob
+  if (( ${#files[@]} )); then
+    local dups; dups="$(grep -hE '^[A-Za-z0-9_]+=[0-9]+$' "${files[@]}" | cut -d= -f2 | sort | uniq -d)"
+    [[ -z "$dups" ]] || { echo "${c_r}✗ Порт выдан дважды в реестре: $(echo "$dups" | tr '\n' ' ')${c_0}"; problems=1; }
+  fi
+
+  # 2) живой порт 80xx, которого нет в реестре (сквоттер)
+  declare -A reg; local b nm
+  while read -r b nm; do [[ -n "$b" ]] && reg[$b]=1; done < <(registry_bases)
+  while read -r b; do
+    [[ -n "$b" ]] || continue
+    is_reserved "$b" && continue
+    [[ -n "${reg[$b]:-}" ]] && continue
+    echo "${c_y}⚠ Блок ${b}-$((b+9)) слушается, но не в реестре — застолби: ports claim <имя>${c_0}"; problems=1
+  done < <(live_bases)
+
+  # 3) блок в реестре, но проект нигде не слушает (возможно, мусор)
+  while read -r b nm; do
+    [[ -n "$b" ]] || continue
+    live_ports | awk -v b="$b" '$1>=b && $1<=b+9' | grep -q . && continue
+    echo "${c_d}· ${b}-$((b+9)) ($nm): в реестре, но не запущен — норма, если проект просто выключен.${c_0}"
+  done < <(registry_bases)
+
+  (( problems )) || echo "${c_g}✔ Конфликтов нет: реестр и живые порты согласованы.${c_0}"
+}
+
+cmd_map(){
+  echo "${c_c}Карта портов VPS${c_0} ${c_d}(host 80xx, все слушают только 127.0.0.1, наружу закрыты)${c_0}"
+  echo "${c_d}Заповедник: ${RESERVED_NOTE}${c_0}"
+  echo "${c_d}${TAILNET_NOTE}${c_0}"
+  echo
+
+  declare -A reg live; local b nm
+  while read -r b nm; do [[ -n "$b" ]] && reg[$b]="$nm"; done < <(registry_bases)
+  while read -r b;    do [[ -n "$b" ]] && live[$b]=1;    done < <(live_bases)
+
+  printf "  ${c_d}%-11s %-14s %-10s %s${c_0}\n" "БЛОК" "ПРОЕКТ" "СТАТУС" "ЖИВЫЕ ПОРТЫ"
+  local lp name status
+  for (( b=LO; b<=HI; b+=10 )); do
+    local proj="${reg[$b]:-}" resv=""; is_reserved "$b" && resv=1
+    [[ -z "$proj" && -z "${live[$b]:-}" && -z "$resv" ]] && continue     # пустые блоки не печатаем
+    lp="$(live_ports | awk -v x="$b" '$1>=x && $1<=x+9' | tr '\n' ' ')"
+    if   [[ -n "$resv" ]];                          then name="(инфра)";        status="${c_c}reserved${c_0}"
+    elif [[ -n "$proj" && -n "${live[$b]:-}" ]];    then name="$proj";           status="${c_g}running${c_0} "
+    elif [[ -n "$proj" ]];                          then name="$proj";           status="${c_y}held${c_0}    "
+    else                                                 name="${c_r}?незарег.${c_0}"; status="${c_r}live${c_0}    "
+    fi
+    printf "  %-11s %-14b %-18b %s\n" "${b}-$((b+9))" "$name" "$status" "$lp"
+  done
+
+  echo
+  local free=()
+  for (( b=LO; b<=HI; b+=10 )); do
+    [[ -n "${reg[$b]:-}" || -n "${live[$b]:-}" ]] && continue
+    is_reserved "$b" && continue
+    free+=("$b")
+  done
+  if (( ${#free[@]} )); then
+    printf "${c_c}Свободно:${c_0} %s-%s" "${free[0]}" "$(( ${free[0]}+9 ))"
+    (( ${#free[@]} > 1 )) && printf ", далее %s, %s…" "${free[1]}" "${free[2]:-}"
+    echo
+  else
+    echo "${c_r}Свободных блоков нет.${c_0}"
+  fi
+  echo "${c_d}Новый проект берёт блок командой:${c_0} ports claim <имя>"
+}
+
+usage(){
+  cat <<EOF
+ports — учёт портов проектов (блок из 10 на проект).
+
+  ports map              карта: занято / зарезервировано / свободно
+  ports claim <имя>      забронировать проекту свободный блок (идемпотентно)
+  ports which <имя>      показать блок проекта
+  ports free <имя>       освободить блок проекта
+  ports doctor           проверить конфликты и рассинхрон с живыми портами
+
+Правило для проектов: не хардкодь порты — возьми блок через 'ports claim',
+и не выходи за его пределы. Всё остальное застолблено соседями.
+EOF
+}
+
+case "${1:-map}" in
+  map|"")   cmd_map ;;
+  claim)    shift; cmd_claim "$@" ;;
+  free)     shift; cmd_free  "$@" ;;
+  which)    shift; cmd_which "$@" ;;
+  doctor)   cmd_doctor ;;
+  -h|--help|help) usage ;;
+  *) die "Неизвестная команда '$1'. Смотри: ports --help" ;;
+esac

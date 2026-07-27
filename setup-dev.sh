@@ -9,9 +9,9 @@
 #  уронить SSH.
 #
 #  ПРИНЦИП: платформа даёт СПОСОБНОСТЬ, проект объявляет ПОТРЕБНОСТЬ.
-#  Здесь ставится только то, что общее для любого стека — docker, mise,
+#  Здесь ставится только то, что общее для любого стека — docker и
 #  tailscale. Языки, рантаймы и БД приходят из репозитория самого проекта
-#  (docker-compose.yml, .mise.toml). Поэтому в этом файле НЕТ и не должно
+#  (docker-compose.yml). Поэтому в этом файле НЕТ и не должно
 #  появиться ни одного упоминания php/postgres/flutter/node — если появилось,
 #  граница слоёв нарушена.
 #
@@ -168,7 +168,11 @@ step_swap() {
   # начать убивать процессы — обычно самый жирный, то есть чью-то сессию
   # посреди работы. Swap не ускоряет ничего, он лишь превращает «убили
   # процесс» в «стало медленно», что для dev-сервера несравнимо лучше.
-  local want_gb=4
+  #
+  # Считаем сумму всех swap-файлов (/proc/swaps): на живом сервере к 4 ГБ
+  # /swap.img руками добавлен /swap2.img до 12 ГБ — шаг видит «уже достаточно»
+  # и не трогает. На чистом сервере создаётся один /swap.img на 12 ГБ.
+  local want_gb=12
   local cur_kb cur_mb
   cur_kb="$(awk 'NR>1 {s+=$3} END {print s+0}' /proc/swaps)"
   cur_mb=$(( cur_kb / 1024 ))
@@ -345,12 +349,11 @@ step_dozzle() {
   # контейнер слушает только 127.0.0.1, доступ с твоих устройств даёт tailscale.
   #
   # Инфра-сервис сервера, а не проект: живёт здесь, а не в /projects. Порт берёт
-  # из инфра-диапазона 8060-8069 (проектные блоки — тоже 80xx, но раздаются
-  # руками и с ним не пересекаются), HTTPS в тайлнет отдаётся на :8444.
+  # из инфра-диапазона 8060-8069. В tailnet его (как и всё веб) отдаёт ports-web
+  # на том же номере порта — https://<host>:8060; отдельного serve тут не держим.
   local name="vps-dozzle"
   local image="amir20/dozzle:latest"   # монитор, не БД — плавающий тег допустим
   local bind="127.0.0.1:8060"          # host → контейнерный 8080
-  local tsport="8444"                  # порт HTTPS в тайлнете (:8443 занят)
 
   command -v docker &>/dev/null || { warn "Docker не установлен — пропускаю Dozzle."; return 0; }
 
@@ -368,88 +371,93 @@ step_dozzle() {
       "$image" >/dev/null
     ok "Dozzle запущен на $bind (docker-сокет только для чтения)."
   fi
-
-  # --- доступ через tailscale ---
-  if ! tailscale status &>/dev/null; then
-    warn "Tailscale не в сети — вход в Dozzle появится после 'sudo tailscale up'."
-    return 0
-  fi
-  if tailscale serve status 2>/dev/null | grep -q ":$tsport"; then
-    skip "Tailscale serve на :$tsport"
-  else
-    say "Отдаю Dozzle в тайлнет по HTTPS…"
-    sudo tailscale serve --bg --https="$tsport" "http://$bind" >/dev/null
-    ok "Отдан."
-  fi
-
-  local host
-  host="$(tailscale status --json | grep -m1 '"DNSName"' | cut -d'"' -f4 | sed 's/\.$//')"
-  say "Dozzle: https://$host:$tsport"
+  say "Dozzle в tailnet: https://<host>:8060 (публикует ports-web, ссылка — на дашборде)"
 }
 
 # ============================================================================
-#  MISE — менеджер версий тулчейнов
+#  DBGATE — веб-клиент БД проектов (просмотр и правка)
 # ============================================================================
-step_mise() {
-  echo; say "═══ mise ═══"
+step_db_client() {
+  echo; say "═══ DbGate ═══"
 
-  # Зачем нужен, если есть docker: не всякий тулчейн осмысленно заворачивать в
-  # контейнер. Мобильная разработка — главный пример: сборка и тесты хотят
-  # SDK на хосте. mise позволяет держать версию SDK в самом проекте
-  # (.mise.toml), а не глобально: два проекта с разными версиями не подерутся,
-  # и версия уезжает вместе с репозиторием на любую машину.
+  # Зачем: одна веб-морда на все базы всех проектов вместо клиента в каждом
+  # контейнере. Инфра-сервис сервера (живёт здесь, не в /projects), паттерн —
+  # как у Dozzle: контейнер слушает только 127.0.0.1, наружу отдаётся через
+  # tailscale. Сохранённые подключения лежат в томе dbgate-data, задаёшь раз.
   #
-  # ЗДЕСЬ НЕ СТАВИТСЯ НИ ОДИН ЯЗЫК. Платформа даёт только менеджер —
-  # что именно ставить, объявляет проект в своём .mise.toml.
-  if command -v mise &>/dev/null || [[ -x "$HOME/.local/bin/mise" ]]; then
-    skip "mise ($("$HOME/.local/bin/mise" version 2>/dev/null | head -1))"
+  # Порт из инфра-диапазона 8060-8069 (следующий за Dozzle). В tailnet отдаёт
+  # ports-web на том же номере — https://<host>:8061; отдельного serve тут нет.
+  local name="vps-dbgate"
+  local image="dbgate/dbgate:latest"   # клиент-обозреватель, не БД — плавающий тег ок
+  local bind="127.0.0.1:8061"          # host → контейнерный 3000
+  local vol="dbgate-data"              # том с сохранёнными подключениями
+
+  command -v docker &>/dev/null || { warn "Docker не установлен — пропускаю DbGate."; return 0; }
+
+  # --- контейнер ---
+  # Пересоздаём только если не бежит: не рестартим docker и не трогаем чужое.
+  if [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" == "true" ]]; then
+    skip "Контейнер $name запущен"
   else
-    say "Ставлю mise…"
-    curl -fsSL https://mise.run | sh
-    ok "mise: $("$HOME/.local/bin/mise" version | head -1)"
+    say "Поднимаю $name…"
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker run -d --name "$name" --restart unless-stopped \
+      -v "$vol:/root/.dbgate" \
+      -p "$bind:3000" \
+      "$image" >/dev/null
+    ok "DbGate запущен на $bind (подключения сохраняются в томе $vol)."
   fi
 
-  # --- PATH для НЕинтерактивных шеллов ---
-  # Тонкое место. В ~/.bashrc первые строки — ранний выход для неинтерактивных
-  # шеллов, поэтому дописанное в конец файла НЕ выполняется, когда команду
-  # запускает агент или systemd. Если положить активацию mise только туда,
-  # тулчейны будут видны тебе в терминале и невидимы агентам — ровно наоборот
-  # тому, что нужно. Поэтому shims (обёртки над бинарниками) прописываем в
-  # ~/.profile, который читают login-шеллы и всё, что от них наследуется.
-  local shims='$HOME/.local/share/mise/shims'
-  if grep -q 'mise/shims' "$HOME/.profile" 2>/dev/null; then
-    skip "shims mise в ~/.profile"
+  # --- доступ к базам проектов ---
+  # Базы порты наружу не публикуют (security-контракт), поэтому клиент цепляем
+  # к docker-сетям, где живут БД: тогда база достижима по ИМЕНИ КОНТЕЙНЕРА
+  # (напр. metsomeone-db-1) без единого открытого порта. Базой считаем контейнер
+  # с образом postgres/mysql/mariadb/mongo. Идемпотентно: к своей сети повторно
+  # не подключаемся. После заведения НОВОГО проекта перезапусти этот скрипт —
+  # клиент доцепится к его сети.
+  local db_re='postgres|mysql|mariadb|mongo'
+  local reachable=() connected=0 cid net img cname
+  while read -r cid img cname; do
+    [[ -n "$cid" ]] || continue
+    reachable+=("$cname")
+    while read -r net; do
+      [[ -n "$net" ]] || continue
+      docker network inspect "$net" -f '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null \
+        | grep -qw "$name" && continue
+      docker network connect "$net" "$name" 2>/dev/null && connected=$((connected+1))
+    done < <(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "$cid" 2>/dev/null)
+  done < <(docker ps --format '{{.ID}} {{.Image}} {{.Names}}' | grep -E " ($db_re)" )
+
+  if (( ${#reachable[@]} == 0 )); then
+    warn "Запущенных БД проектов не нашёл — подключения добавишь в DbGate вручную."
   else
-    say "Добавляю shims mise в ~/.profile…"
-    printf '\n# mise: тулчейны проектов должны быть видны и неинтерактивным шеллам (агентам)\nexport PATH="%s:$PATH"\n' "$shims" >> "$HOME/.profile"
-    ok "~/.profile обновлён."
+    (( connected > 0 )) && ok "Клиент подключён к $connected сет(и/ям) с БД." \
+                        || skip "Сети БД уже подключены"
+    say "Базы (host в DbGate = имя контейнера, порт — стандартный для движка):"
+    printf '        %s\n' "${reachable[@]}"
   fi
 
-  # --- Активация для интерактивных шеллов ---
-  # Полноценная активация (в отличие от shims) переключает версии при переходе
-  # между папками — это для живой работы в терминале.
-  if grep -q 'mise activate' "$HOME/.bashrc" 2>/dev/null; then
-    skip "активация mise в ~/.bashrc"
-  else
-    say "Добавляю активацию mise в ~/.bashrc…"
-    printf '\neval "$(%s/.local/bin/mise activate bash)"\n' "$HOME" >> "$HOME/.bashrc"
-    ok "~/.bashrc обновлён."
-  fi
+  say "DbGate в tailnet: https://<host>:8061 (публикует ports-web, ссылка — на дашборде)"
+}
 
-  # --- Доверие к конфигам проектов ---
-  # По умолчанию mise требует подтвердить каждый новый .mise.toml вручную
-  # (защита от чужого репозитория, который пропишет себе левый бинарник). Для
-  # агента это тупик: он получит отказ и не сможет ответить на запрос.
-  # Всё в /projects мы клонируем сами и осознанно, поэтому доверяем каталогу.
-  if grep -q 'MISE_TRUSTED_CONFIG_PATHS' "$HOME/.profile" 2>/dev/null; then
-    skip "доверие к конфигам в $PROJECTS_DIR"
-  else
-    say "Разрешаю mise доверять конфигам в $PROJECTS_DIR…"
-    printf 'export MISE_TRUSTED_CONFIG_PATHS="%s"\n' "$PROJECTS_DIR" >> "$HOME/.profile"
-    ok "Доверие настроено."
-  fi
+# ============================================================================
+#  PORTS — CLI учёта портов (ставим команду, сам реестр раздаёт step_ports)
+# ============================================================================
+step_portstool() {
+  echo; say "═══ Учёт портов (ports) ═══"
 
-  ok "mise готов (языки ставит проект, не платформа)."
+  # Самообслуживание для проектов: `ports claim <имя>` атомарно бронирует
+  # свободный блок, `ports map` показывает занятое/свободное. Исходник — bin/ports
+  # в репозитории (в git → переживает переезд), сюда просто копируем на PATH.
+  local src="$REPO_DIR/bin/ports" dst="$HOME/.local/bin/ports"
+  [[ -f "$src" ]] || { warn "Нет $src — пропускаю"; return; }
+  install -d -m 755 "$HOME/.local/bin"
+  if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
+    skip "Команда ports установлена"
+  else
+    install -m 755 "$src" "$dst"
+    ok "Команда ports установлена (ports map / claim / free / doctor)."
+  fi
 }
 
 # ============================================================================
@@ -491,6 +499,7 @@ step_ports() {
     [[ -n "$min" ]] || { warn "$name: в файле нет ни одного порта, пропускаю"; continue; }
     base=$(( min / 10 * 10 ))
     (( max <= base + 9 )) || die "$name: порты $min-$max не помещаются в блок ${base}-$((base+9)) — расширь блок или сократи список."
+    (( base != 8060 )) || die "$name: блок 8060-8069 зарезервирован под инфру (dozzle/dbgate). Возьми другой: ports claim $name."
 
     local proj_dir="$PROJECTS_DIR/$name"
     if [[ ! -d "$proj_dir" ]]; then
@@ -533,6 +542,67 @@ step_ports() {
   done
 
   ok "Порты розданы, пересечений нет."
+}
+
+# ============================================================================
+#  DASHBOARD — веб-сервисы в tailnet (порт=порт) + страница со ссылками
+# ============================================================================
+# ports-web отдаёт каждый веб-сервис проекта в tailnet на его же номере порта
+# (tailnet :8050 → host :8050) и рисует index.html со ссылками на всё занятое.
+# Таймер раз в минуту держит и раскладку serve, и страницу в актуальном виде:
+# поднял новый проект — он сам появится и в tailnet, и на дашборде.
+step_dashboard() {
+  echo; say "═══ Дашборд сервисов ═══"
+
+  local src="$REPO_DIR/bin/ports-web" dst="$HOME/.local/bin/ports-web"
+  [[ -f "$src" ]] || { warn "Нет $src — пропускаю"; return; }
+  install -d -m 755 "$HOME/.local/bin"
+  if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
+    skip "Команда ports-web установлена"
+  else
+    install -m 755 "$src" "$dst"
+    ok "Команда ports-web установлена."
+  fi
+
+  if ! tailscale status &>/dev/null; then
+    warn "Tailscale не в сети — дашборд поднимется после 'sudo tailscale up'."
+  else
+    "$dst" >/dev/null 2>&1 || true    # первый прогон: разложить serve и сгенерить страницу
+    local host
+    host="$(tailscale status --json | grep -m1 '"DNSName"' | cut -d'"' -f4 | sed 's/\.$//')"
+    ok "Веб-сервисы отданы в tailnet на своих портах."
+    say "Дашборд: https://$host:8062"
+  fi
+
+  # --- таймер: держим serve и страницу свежими ---
+  install -d -m 755 "$HOME/.config/systemd/user"
+  cat > "$HOME/.config/systemd/user/ports-web.service" <<'UNIT'
+[Unit]
+Description=Опубликовать веб-сервисы в tailnet и обновить дашборд
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ports-web
+UNIT
+  cat > "$HOME/.config/systemd/user/ports-web.timer" <<'UNIT'
+[Unit]
+Description=Обновлять раскладку tailnet и дашборд сервисов
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=20s
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl --user daemon-reload
+  systemctl --user enable --now ports-web.timer >/dev/null 2>&1
+  if systemctl --user is-active --quiet ports-web.timer; then
+    ok "Автообновление включено: раз в минуту."
+  else
+    warn "Таймер дашборда не запустился: systemctl --user status ports-web.timer"
+  fi
 }
 
 # ============================================================================
@@ -691,8 +761,10 @@ main() {
   step_firewall
   step_tailscale
   step_dozzle
-  step_mise
+  step_db_client
+  step_portstool
   step_ports
+  step_dashboard
   step_autopull
   step_rules
 

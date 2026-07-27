@@ -33,7 +33,7 @@ STEPS=(
   "Вход в Claude Code"
   "Вход в GitHub"
   "Автозапуск управляющей сессии"
-  "Платформа: docker, tailscale, mise"
+  "Платформа: docker, tailscale"
   "Подключение к сети Tailscale"
 )
 

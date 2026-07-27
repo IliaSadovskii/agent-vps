@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# ports-web — публикует веб-сервисы проектов в tailnet и рисует дашборд.
+#
+# Исходник — bin/ports-web в репозитории vps; в ~/.local/bin ставит setup-dev.sh,
+# запускает по таймеру (см. step_dashboard). Руками звать не нужно.
+#
+# ЧТО ДЕЛАЕТ.
+#  1. Берёт docker-порты, опубликованные на 127.0.0.1, и по ОБРАЗУ контейнера
+#     делит их на веб и внутренние (postgres/mysql/redis… → внутренний, наружу
+#     не отдаётся). По образу, а не HTTP-пробой: проба капризна на медленных
+#     приложениях, образ детерминирован.
+#  2. Каждый веб-сервис отдаёт в tailnet НА ТОМ ЖЕ НОМЕРЕ порта (tailnet :8050 →
+#     host :8050) — один номер на сервис, совпадает с `ports map`. Serve правится
+#     по дельте (только при изменении состава), появившиеся/ушедшие подхватывает.
+#  3. Генерит index.html со ссылками на все сервисы, сгруппированные по проектам,
+#     и отдаёт его в tailnet на :8062. Страница сама обновляется (мета-рефреш) и
+#     перегенерируется по таймеру — всегда актуальна.
+set -uo pipefail
+
+PORTS_DIR="${PORTS_DIR:-$HOME/vps/ports}"
+STATE_DIR="${STATE_DIR:-$HOME/.local/state/ports-web}"
+DASH_PORT=8062
+mkdir -p "$STATE_DIR"
+
+dnsname="$(tailscale status --json 2>/dev/null | grep -m1 '"DNSName"' | cut -d'"' -f4 | sed 's/\.$//')"
+[[ -n "$dnsname" ]] || { echo "ports-web: tailscale не в сети, выхожу" >&2; exit 0; }
+
+# --- инфра-сервисы (не в реестре проектов) ---
+declare -A INFRA_LABEL=( [8060]="Dozzle" [8061]="DbGate" [$DASH_PORT]="Дашборд" )
+declare -A INFRA_DESC=( [8060]="логи docker-контейнеров" [8061]="клиент баз данных" [$DASH_PORT]="эта страница" )
+
+# --- разбор реестра: порт → проект и порт → человекочитаемое имя сервиса ------
+declare -A PORT_PROJECT PORT_LABEL
+humanize(){ # имя переменной → имя сервиса (Moscow, App, Web…)
+  local t out=() low
+  for t in ${1//_/ }; do
+    case "${t^^}" in PORT|NGINX|FORWARD) continue;; esac
+    low="${t,,}"                       # всё в нижний регистр…
+    out+=( "${low^}" )                 # …и первую букву в верхний → Moscow, App, Web
+  done
+  local s="${out[*]}"; echo "${s:-$1}"
+}
+shopt -s nullglob
+for f in "$PORTS_DIR"/*.env; do
+  name="$(basename "$f" .env)"
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([A-Za-z0-9_]+)=([0-9]+)([[:space:]]*#[[:space:]]*(.*))?$ ]] || continue
+    local_key="${BASH_REMATCH[1]}"; local_port="${BASH_REMATCH[2]}"; local_cmt="${BASH_REMATCH[4]}"
+    [[ "$local_key" == "BASE_PORT" ]] && continue
+    PORT_PROJECT[$local_port]="$name"
+    PORT_LABEL[$local_port]="${local_cmt:-$(humanize "$local_key")}"
+  done < "$f"
+done
+shopt -u nullglob
+
+# --- живые сервисы: docker-порты на 127.0.0.1 → образ контейнера -------------
+# Веб или внутренний решаем по ОБРАЗУ (postgres/mysql/redis… → внутренний), а не
+# по HTTP-пробе: проба капризна (медленный Laravel под нагрузкой таймаутит и
+# уезжает в «внутренние»), а образ детерминирован. Слушатели tailscaled на
+# tailnet-адресе сюда не попадают — берём только 127.0.0.1 из docker ps.
+declare -A PORT_IMAGE
+while IFS=$'\t' read -r image ports; do
+  while read -r hp; do [[ -n "$hp" ]] && PORT_IMAGE[$hp]="$image"; done \
+    < <(grep -oE '127\.0\.0\.1:80[0-9][0-9]' <<<"$ports" | grep -oE '80[0-9][0-9]')
+done < <(docker ps --format '{{.Image}}\t{{.Ports}}' 2>/dev/null)
+
+DB_RE='postgres|mysql|mariadb|mongo|redis|valkey'
+# <title> страницы — только как описание, на классификацию не влияет.
+http_title(){ curl -sL -m 3 "http://127.0.0.1:$1/" 2>/dev/null | grep -oiE '<title>[^<]*' | head -1 | sed -E 's/<title>//i; s/^[[:space:]]+//; s/[[:space:]]+$//'; }
+
+# строки: "port<TAB>group<TAB>name<TAB>desc<TAB>web(1/0)"
+rows=""
+for p in $(printf '%s\n' "${!PORT_IMAGE[@]}" | sort -un); do
+  img="${PORT_IMAGE[$p]}"; proj="${PORT_PROJECT[$p]:-}"; label="${PORT_LABEL[$p]:-}"
+  if [[ -n "${INFRA_LABEL[$p]:-}" ]]; then group="инфраструктура"; name="${INFRA_LABEL[$p]}"; desc="${INFRA_DESC[$p]:-}"
+  elif [[ -n "$proj" ]];              then group="$proj";           name="${label:-сервис}"; desc=""
+  else                                     group="без реестра";     name="?"; desc="порт не застолблён (ports claim)"
+  fi
+  if grep -qiE "$DB_RE" <<<"$img"; then
+    web=0; [[ -n "$desc" ]] || desc="внутренний · $img"
+  else
+    web=1; [[ -n "$desc" ]] || desc="$(http_title "$p")"
+  fi
+  # Разделитель — US (0x1f), НЕ таб: таб пробельный, и read со IFS=$'\t'
+  # схлопывает соседние табы, теряя пустые поля (пустой desc сдвигал бы web).
+  printf -v r '%s\x1f%s\x1f%s\x1f%s\x1f%s' "$p" "$group" "$name" "$desc" "$web"
+  rows+="$r"$'\n'
+done
+# дашборд не docker-порт (его отдаёт tailscaled) — добавляем строку явно
+rows+="$(printf '%s\x1f%s\x1f%s\x1f%s\x1f%s' "$DASH_PORT" "инфраструктура" "${INFRA_LABEL[$DASH_PORT]}" "${INFRA_DESC[$DASH_PORT]}" 1)"$'\n'
+
+[[ -n "${DEBUG:-}" ]] && { echo "=== ROWS ===" >&2; printf '%s' "$rows" >&2; }
+
+# --- 1) tailscale serve: по одному https-порту на веб-сервис (tailnet :P → :P)
+# Желаемое множество веб-портов; цель у каждого детерминирована (proxy на тот же
+# порт; дашборд — статическая папка), поэтому сверяем только СОСТАВ портов и
+# трогаем serve лишь когда он изменился — без «моргания» на каждом тике таймера.
+declare -A want
+while IFS=$'\x1f' read -r p group name desc web; do
+  [[ "$web" == 1 ]] || continue
+  want[$p]=1
+done <<<"$rows"
+# ports-web — единственный хозяин tailnet-serve: состав всегда приводится к
+# желаемому (веб-сервисы + дашборд), любое лишнее снимается. Само-исцеляется и
+# не «моргает»: в устоявшемся состоянии обе ветки — no-op (add/off не нужны).
+current="$(tailscale serve status --json 2>/dev/null | grep -oE '"[0-9]{4,5}":' | tr -dc '0-9\n' | sort -un)"
+# добавить недостающие. tailscale правит один конфиг, и пачка команд подряд
+# ловит гонку (часть молча не применяется) — поэтому проверяем и ретраим.
+for p in "${!want[@]}"; do
+  grep -qx "$p" <<<"$current" && continue
+  local_tgt="http://127.0.0.1:$p"; [[ "$p" == "$DASH_PORT" ]] && local_tgt="$STATE_DIR/"
+  for _try in 1 2 3 4 5; do
+    tailscale serve status 2>/dev/null | grep -q "ts\.net:$p" && break
+    sudo -n tailscale serve --bg --https="$p" "$local_tgt" >/dev/null 2>&1
+    sleep 0.4
+  done
+done
+# снять всё, чего в желаемом нет (старые 844x, ушедшие проекты)
+for p in $current; do
+  [[ -n "${want[$p]:-}" ]] || sudo -n tailscale serve --https="$p" off >/dev/null 2>&1
+done
+
+# --- 2) дашборд index.html --------------------------------------------------
+esc(){ sed -e 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
+html="$STATE_DIR/index.html.tmp"
+{
+cat <<HEAD
+<!doctype html><html lang="ru"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>Сервисы VPS</title>
+<style>
+ :root{color-scheme:light dark}
+ body{font:15px/1.5 system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem}
+ h1{font-size:1.3rem;margin:0 0 .2rem}
+ .sub{opacity:.6;font-size:.85rem;margin-bottom:1.5rem}
+ section{margin:1.4rem 0}
+ h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.05em;opacity:.55;
+    border-bottom:1px solid color-mix(in srgb,currentColor 15%,transparent);padding-bottom:.3rem}
+ .row{display:flex;align-items:baseline;gap:.6rem;padding:.4rem 0}
+ .port{font-variant-numeric:tabular-nums;opacity:.5;font-size:.85rem;min-width:3.2em}
+ a{font-weight:600;text-decoration:none;color:#2563eb}
+ a:hover{text-decoration:underline}
+ @media(prefers-color-scheme:dark){a{color:#7aa7ff}}
+ .name{font-weight:600}
+ .desc{opacity:.6;font-size:.88rem}
+ .int{opacity:.45}
+ .int .name{font-weight:500}
+</style></head><body>
+<h1>Сервисы VPS</h1>
+<div class="sub">$dnsname · обновляется автоматически · порт = его же адрес в tailnet</div>
+HEAD
+
+# порядок групп: инфраструктура первой, потом проекты по алфавиту, «без реестра» в конце
+groups="$(cut -d$'\x1f' -f2 <<<"$rows" | sort -u)"
+ordered="$( { grep -x 'инфраструктура' <<<"$groups"; grep -vx 'инфраструктура' <<<"$groups" | grep -vx 'без реестра' | sort; grep -x 'без реестра' <<<"$groups"; } 2>/dev/null )"
+
+while IFS= read -r g; do
+  [[ -n "$g" ]] || continue
+  printf '<section><h2>%s</h2>\n' "$(esc <<<"$g")"
+  # внутри группы: сначала веб, по возрастанию порта
+  while IFS=$'\x1f' read -r p group name desc web; do
+    [[ "$group" == "$g" ]] || continue
+    ename="$(printf '%s' "$name" | esc)"; edesc="$(printf '%s' "$desc" | esc)"
+    if [[ "$web" == 1 ]]; then
+      printf '  <div class="row"><span class="port">%s</span><a href="https://%s:%s/">%s</a><span class="desc">%s</span></div>\n' \
+        "$p" "$dnsname" "$p" "$ename" "$edesc"
+    else
+      printf '  <div class="row int"><span class="port">%s</span><span class="name">%s</span><span class="desc">%s</span></div>\n' \
+        "$p" "$ename" "$edesc"
+    fi
+  done < <(sort -t$'\x1f' -k5,5r -k1,1n <<<"$rows")
+  printf '</section>\n'
+done <<<"$ordered"
+
+echo '</body></html>'
+} > "$html"
+mv "$html" "$STATE_DIR/index.html"
