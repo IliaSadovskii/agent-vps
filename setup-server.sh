@@ -11,6 +11,7 @@
 #    · пакеты, Node.js, Claude Code
 #    · bypass-режим Claude, каталог /projects
 #    · механизм параллельных сессий (claude-new / list / kill + скилл)
+#    · реестр сессий и их восстановление после ребута и падений (claude-restore)
 #    · хардинг: SSH только по ключу, root off, fail2ban, UFW
 #
 #  >>> потом вручную (в браузере) авторизуешь Claude <<<
@@ -58,6 +59,54 @@ install_parallel_sessions() {
   #  cc-<имя>  — ПОБОЧНАЯ (claude-new): временная управляющая или дочерняя
   # ───────────────────────────────────────────────────────────────────
 
+  # ── РЕЕСТР ОТКРЫТЫХ СЕССИЙ ─────────────────────────────────────────
+  #  ~/.claude/open-sessions/<tmux-имя> — по файлу на сессию:
+  #     workdir=<папка>     — где сессия была запущена
+  #     session=<uuid>      — последний известный id диалога (для --resume)
+  #  Запись появляется при создании сессии и исчезает при ЯВНОМ закрытии
+  #  (claude-close*, автоочистка). Аварийная смерть (OOM, краш, ребут) записи
+  #  НЕ трогает — именно по ней claude-restore поднимает сессию обратно.
+  # ───────────────────────────────────────────────────────────────────
+  cat > "$bin/claude-registry" <<'REG_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+REG="$HOME/.claude/open-sessions"
+mkdir -p "$REG/.revives"
+cmd="${1:-}"
+name="${2:-}"
+# Имена сессий валидируются при создании (^[A-Za-z0-9-]+$ с префиксом cc-/ccp-),
+# но реестр вызывается и из других мест — проверяем ещё раз, это путь к файлу.
+if [[ -n "$name" ]] && ! [[ "$name" =~ ^(cc|ccp)-[A-Za-z0-9-]+$ ]]; then
+  echo "claude-registry: недопустимое имя сессии '$name'" >&2
+  exit 1
+fi
+case "$cmd" in
+  add)
+    printf 'workdir=%s\n' "${3:?нужна папка}" > "$REG/$name"
+    # Ручное открытие снимает «карантин» упавшей сессии — счётчик подъёмов с нуля.
+    rm -f "$REG/.revives/$name"
+    ;;
+  set-session)
+    [[ -f "$REG/$name" ]] || exit 0
+    { grep -v '^session=' "$REG/$name" || true; printf 'session=%s\n' "${3:?нужен id}"; } > "$REG/$name.tmp"
+    mv "$REG/$name.tmp" "$REG/$name"
+    ;;
+  del)
+    rm -f "$REG/$name" "$REG/.revives/$name"
+    ;;
+  get)
+    sed -n "s/^${3:?нужен ключ}=//p" "$REG/$name" 2>/dev/null | tail -1
+    ;;
+  list)
+    find "$REG" -maxdepth 1 -type f ! -name '.*' ! -name '*.tmp' -printf '%f\n' 2>/dev/null | sort
+    ;;
+  *)
+    echo "Использование: claude-registry {add <имя> <папка>|set-session <имя> <id>|del <имя>|get <имя> <ключ>|list}" >&2
+    exit 1
+    ;;
+esac
+REG_EOF
+
   # claude-new — ПОБОЧНАЯ сессия В ТЕКУЩЕЙ папке (наследует папку родителя).
   # Из vps-main (~/vps) → в ~/vps. Изнутри проекта → в папке проекта.
   cat > "$bin/claude-new" <<'HELPER_EOF'
@@ -91,6 +140,7 @@ tmux new-session -d -s "cc-$NAME" -c "$WORKDIR" \
   "$CLAUDE_BIN --dangerously-skip-permissions --remote-control --name vps-$NAME"
 sleep 2
 if tmux has-session -t "cc-$NAME" 2>/dev/null; then
+  "$HOME/.local/bin/claude-registry" add "cc-$NAME" "$WORKDIR" || true
   echo "✔ Сессия 'vps-$NAME' (побочная) запущена в: $WORKDIR"
   echo "  Закрыть: claude-close $NAME"
 else
@@ -155,6 +205,7 @@ tmux new-session -d -s "ccp-$NAME" -c "$PROJ_PATH" \
   "$CLAUDE_BIN --dangerously-skip-permissions --remote-control --name proj-$NAME"
 sleep 2
 if tmux has-session -t "ccp-$NAME" 2>/dev/null; then
+  "$HOME/.local/bin/claude-registry" add "ccp-$NAME" "$PROJ_PATH" || true
   echo "✔ Проект 'proj-$NAME' $VERB в $PROJ_PATH, сессия запущена (главная проекта)."
   echo "  Внутри неё claude-new создаёт дочерние сессии в этой же папке."
 else
@@ -194,6 +245,19 @@ while IFS= read -r line; do
   esac
 done < <(tmux ls 2>/dev/null || true)
 [ "$found" = "0" ] && echo "  (активных сессий нет)"
+
+# Числятся в реестре, но не живы — упали и ждут сторожа (проверка раз в 5 минут).
+pending=0
+for tn in $("$HOME/.local/bin/claude-registry" list 2>/dev/null || true); do
+  tmux has-session -t "$tn" 2>/dev/null && continue
+  if [ "$pending" = "0" ]; then echo; echo "Упали, будут подняты автоматически:"; pending=1; fi
+  case "$tn" in
+    ccp-*) echo "  • proj-${tn#ccp-} (главная проекта)";;
+    cc-*)  echo "  • vps-${tn#cc-} (побочная)";;
+  esac
+done
+[ "$pending" = "1" ] && echo "  Поднять прямо сейчас: claude-restore"
+
 echo
 echo "Закрыть: claude-close <имя> | все побочные: claude-close-all | всё: claude-close-everything"
 LIST_EOF
@@ -257,6 +321,9 @@ if [[ -n "$proj" && -d "/projects/$proj" ]] && command -v docker >/dev/null 2>&1
   fi
 fi
 
+# Снимаем с реестра ДО убийства: закрытие намеренное, поднимать обратно не надо.
+"$HOME/.local/bin/claude-registry" del "$TN" || true
+
 echo "✔ Сессия '$disp' закрывается… через пару секунд станет offline. Файлы на диске целы."
 ( sleep 2; tmux kill-session -t "$TN" 2>/dev/null ) &
 disown 2>/dev/null || true
@@ -268,6 +335,7 @@ CLOSE_EOF
 set -euo pipefail
 n=0
 for s in $(tmux ls 2>/dev/null | cut -d: -f1 | grep '^cc-'); do
+  "$HOME/.local/bin/claude-registry" del "$s" || true
   ( sleep 2; tmux kill-session -t "$s" 2>/dev/null ) &
   disown 2>/dev/null || true
   echo "  закрываю побочную: vps-${s#cc-}"
@@ -286,6 +354,7 @@ CLOSEALL_EOF
 set -euo pipefail
 n=0
 for s in $(tmux ls 2>/dev/null | cut -d: -f1 | grep -E '^(cc-|ccp-)'); do
+  "$HOME/.local/bin/claude-registry" del "$s" || true
   ( sleep 2; tmux kill-session -t "$s" 2>/dev/null ) &
   disown 2>/dev/null || true
   if [ "${s#ccp-}" != "$s" ]; then echo "  закрываю проект: proj-${s#ccp-}"
@@ -361,10 +430,133 @@ tmux ls 2>/dev/null | cut -d: -f1 | grep '^cc-' | while read -r sname; do
   idle=$(( now - last ))
   if [ "$idle" -gt "$max_idle" ]; then
     echo "$(date '+%F %T') автоочистка: закрываю '$sname' (простой $((idle/86400)) дн)"
+    # Снять с реестра обязательно — иначе сторож поднимет её обратно через 5 минут.
+    "$HOME/.local/bin/claude-registry" del "$sname" 2>/dev/null || true
     tmux kill-session -t "$sname" 2>/dev/null || true
   fi
 done
 CLEANUP_EOF
+
+  # claude-restore — поднимает сессии из реестра, которых нет в живых.
+  #   --boot  : после старта claude-ops (ребут / рестарт сервиса) — без ограничений
+  #   --watch : раз в 5 минут таймером — со страховкой от циклического падения
+  # Диалог продолжается: по записанному id (--resume) либо последним диалогом
+  # этой папки (--continue). Если истории нет — сессия стартует чистой.
+  cat > "$bin/claude-restore" <<'RESTORE_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+MODE="${1:---watch}"
+REG="$HOME/.claude/open-sessions"
+REV="$REG/.revives"
+REGISTRY="$HOME/.local/bin/claude-registry"
+CLAUDE_BIN="$HOME/.local/bin/claude"
+[[ -x "$CLAUDE_BIN" ]] || CLAUDE_BIN="claude"
+# Не поднимаем сессии, когда памяти уже мало: очередной claude только добьёт
+# сервер (именно OOM и убивает сессии, которые мы здесь чиним).
+MIN_FREE_MB="${MIN_FREE_MB:-800}"
+# Сколько раз за час сторож готов поднимать одну и ту же сессию.
+MAX_REVIVES="${MAX_REVIVES:-3}"
+# Пауза между запусками — чтобы N сессий не стартовали одновременно.
+STAGGER="${STAGGER:-3}"
+mkdir -p "$REG" "$REV"
+
+log() { echo "$(date '+%F %T') claude-restore: $*"; }
+
+# Один экземпляр за раз: таймер и ExecStartPost могут пересечься.
+exec 9>"$REG/.lock"
+flock -n 9 || exit 0
+
+# ── 1. Синхронизация id диалогов у ЖИВЫХ сессий ────────────────────
+# Пока сессия жива, claude держит ~/.claude/sessions/<pid>.json со своим
+# текущим sessionId. Складываем его в реестр, чтобы после падения поднять
+# именно тот диалог, а не «последний в папке» (в одной папке сессий бывает две).
+for f in "$HOME"/.claude/sessions/*.json; do
+  [[ -e "$f" ]] || continue
+  pid="$(basename "$f" .json)"
+  # файл мог остаться от убитого процесса — проверяем, что pid жив
+  [[ -d "/proc/$pid" ]] || continue
+  disp="$(jq -r '.name // empty' "$f" 2>/dev/null || true)"
+  sid="$(jq -r '.sessionId // empty' "$f" 2>/dev/null || true)"
+  [[ -n "$disp" && -n "$sid" ]] || continue
+  case "$disp" in
+    vps-main) continue ;;                 # основная, в реестре не числится
+    proj-*)   tn="ccp-${disp#proj-}" ;;
+    vps-*)    tn="cc-${disp#vps-}" ;;
+    *)        continue ;;
+  esac
+  "$REGISTRY" set-session "$tn" "$sid" 2>/dev/null || true
+done
+
+# ── 2. Подъём сессий, которых нет в живых ──────────────────────────
+restored=0
+for tn in $("$REGISTRY" list); do
+  tmux has-session -t "$tn" 2>/dev/null && continue
+
+  wd="$("$REGISTRY" get "$tn" workdir)"
+  if [[ -z "$wd" || ! -d "$wd" ]]; then
+    log "папка сессии '$tn' исчезла ($wd) — убираю из реестра"
+    "$REGISTRY" del "$tn"
+    continue
+  fi
+
+  case "$tn" in
+    ccp-*) disp="proj-${tn#ccp-}" ;;
+    cc-*)  disp="vps-${tn#cc-}" ;;
+    *)     continue ;;
+  esac
+
+  # Страховка от цикла: если сессия падает сразу после подъёма, перестаём
+  # её дёргать. Окно скользящее — через час после последнего падения
+  # счётчик обнуляется сам; ручное открытие сбрасывает его сразу.
+  if [[ "$MODE" == "--watch" ]]; then
+    now=$(date +%s); cutoff=$((now - 3600)); rf="$REV/$tn"
+    if [[ -f "$rf" ]]; then
+      awk -v c="$cutoff" '$1 > c' "$rf" > "$rf.tmp" 2>/dev/null && mv "$rf.tmp" "$rf"
+    fi
+    n=0
+    if [[ -f "$rf" ]]; then n=$(wc -l < "$rf"); fi
+    if (( n >= MAX_REVIVES )); then
+      log "'$disp' падает повторно ($n раз за час) — больше не поднимаю, нужно разобраться вручную"
+      continue
+    fi
+    echo "$now" >> "$rf"
+  fi
+
+  avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+  if (( avail < MIN_FREE_MB )); then
+    log "свободно ${avail} МБ (< ${MIN_FREE_MB}) — откладываю подъём '$disp' до следующей проверки"
+    break
+  fi
+
+  # Чем продолжить диалог: точный id из реестра → последний диалог папки → ничего.
+  mangled="$(echo "$wd" | sed 's#[/.]#-#g')"
+  sid="$("$REGISTRY" get "$tn" session)"
+  if [[ -n "$sid" && -f "$HOME/.claude/projects/$mangled/$sid.jsonl" ]]; then
+    resume=(--resume "$sid")
+    how="диалог продолжен"
+  elif compgen -G "$HOME/.claude/projects/$mangled/*.jsonl" >/dev/null 2>&1; then
+    resume=(--continue)
+    how="продолжен последний диалог папки"
+  else
+    resume=()
+    how="история не найдена, старт с чистого листа"
+  fi
+
+  tmux new-session -d -s "$tn" -c "$wd" \
+    "$CLAUDE_BIN ${resume[*]} --dangerously-skip-permissions --remote-control --name $disp"
+  sleep 2
+  if tmux has-session -t "$tn" 2>/dev/null; then
+    log "поднял '$disp' в $wd ($how)"
+    restored=$((restored + 1))
+    sleep "$STAGGER"
+  else
+    log "не удалось поднять '$disp' в $wd"
+  fi
+done
+
+(( restored > 0 )) && log "восстановлено сессий: $restored"
+exit 0
+RESTORE_EOF
 
   # ── СКИЛЛЫ ─────────────────────────────────────────────────────────
   # Каждая возможность — отдельный скилл (папка + SKILL.md). Имя папки даёт
@@ -415,6 +607,11 @@ name: vps-sessions
 description: Показать список живых Claude-сессий на этом VPS и сколько памяти каждая занимает. Используй, когда пользователь спрашивает, какие сессии открыты, сколько их, сколько памяти они едят ("какие сессии открыты", "покажи сессии", "сколько памяти жрут сессии"). Слэш-команда /vps-sessions.
 ---
 Выполни `claude-list` и покажи пользователю результат — список сессий с памятью каждой.
+
+Если в выводе есть блок «Упали, будут подняты автоматически» — это сессии, чей процесс
+умер (обычно OOM), а карточка в приложении осталась висеть. Скажи об этом и предложи
+поднять сразу: `claude-restore` (иначе сторож сделает это сам в течение 5 минут).
+Причину падения видно в `journalctl -b -1 | grep -i oom` и `journalctl --user -u claude-restore -e`.
 S_EOF
 
   # /vps-close
@@ -461,7 +658,7 @@ description: Показать готовую команду для подклю�
 S_EOF
 
 
-  chmod +x "$bin/claude-new" "$bin/claude-project" "$bin/claude-list" "$bin/claude-close" "$bin/claude-close-all" "$bin/claude-close-everything" "$bin/claude-ssh" "$bin/claude-cleanup"
+  chmod +x "$bin/claude-new" "$bin/claude-project" "$bin/claude-list" "$bin/claude-close" "$bin/claude-close-all" "$bin/claude-close-everything" "$bin/claude-ssh" "$bin/claude-cleanup" "$bin/claude-registry" "$bin/claude-restore"
   chown -R "$DEV_USER:$DEV_USER" "$home/.local" "$home/.claude"
 }
 
@@ -737,6 +934,17 @@ setup_service() {
   say "Настраиваю автозапуск (systemd user service + linger)…"
   sudo loginctl enable-linger "$USER"
   mkdir -p "$HOME/.config/systemd/user"
+
+  # Догоняем реестр живыми сессиями: при первой установке (и после ручных
+  # запусков tmux) в нём может не быть того, что сейчас открыто. Сделать это
+  # надо ДО рестарта сервиса — он погасит сессии, и восстанавливать будет нечего.
+  for s in $(tmux ls 2>/dev/null | cut -d: -f1 | grep -E '^(cc-|ccp-)' || true); do
+    [[ -f "$HOME/.claude/open-sessions/$s" ]] && continue
+    wd="$(tmux display-message -p -t "$s" '#{pane_current_path}' 2>/dev/null || true)"
+    [[ -n "$wd" ]] || continue
+    "$HOME/.local/bin/claude-registry" add "$s" "$wd" 2>/dev/null \
+      && echo "  в реестр: $s → $wd"
+  done
   cat > "$HOME/.config/systemd/user/claude-ops.service" <<EOF
 [Unit]
 Description=Claude Code Remote Control (tmux, $PROJECTS_DIR)
@@ -749,15 +957,20 @@ Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=$OPS_DIR
 # При каждом старте сервиса закрываем ВСЕ старые сессии (основную, побочные,
 # проектные) — чтобы после обновления bootstrap гарантированно нигде не остался
-# устаревший скилл. Живой остаётся только заново поднятая vps-main; проекты
-# переоткрываются вручную (claude-project <имя>), код на диске цел.
-# Первый ExecStartPre гасит побочные/проектные, второй — старую основную.
+# устаревший скилл. Первый ExecStartPre гасит побочные/проектные, второй —
+# старую основную.
 ExecStartPre=-/bin/sh -c 'tmux ls 2>/dev/null | cut -d: -f1 | grep -E "^(cc-|ccp-)" | xargs -r -n1 tmux kill-session -t'
 ExecStartPre=-/usr/bin/tmux kill-session -t $TMUX_SESSION
 ExecStart=/usr/bin/tmux new-session -d -s $TMUX_SESSION 'claude --dangerously-skip-permissions --remote-control --name vps-main'
+# …и сразу поднимаем их заново из реестра — уже с обновлённым bootstrap и с
+# продолжением прежнего диалога. Это же возвращает сессии после перезагрузки
+# сервера. Сессии, закрытые намеренно, в реестре не числятся и не вернутся.
+ExecStartPost=-%h/.local/bin/claude-restore --boot
 ExecStop=/usr/bin/tmux kill-session -t $TMUX_SESSION
 Restart=on-failure
 RestartSec=10
+# Восстановление поднимает сессии по одной с паузой — даём ему время.
+TimeoutStartSec=600
 
 [Install]
 WantedBy=default.target
@@ -775,6 +988,34 @@ EOF
     echo "    systemctl --user status claude-ops.service"
     echo "    journalctl --user -u claude-ops.service -e"
   fi
+
+  # --- Сторож: поднимает упавшие сессии (раз в 5 минут) ---
+  say "Настраиваю сторожа сессий (подъём после падения/OOM)…"
+  cat > "$HOME/.config/systemd/user/claude-restore.service" <<EOF
+[Unit]
+Description=Поднять Claude-сессии из реестра, которых нет в живых
+After=claude-ops.service
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/claude-restore --watch
+TimeoutStartSec=600
+EOF
+  cat > "$HOME/.config/systemd/user/claude-restore.timer" <<EOF
+[Unit]
+Description=Проверять раз в 5 минут, не упала ли Claude-сессия
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now claude-restore.timer
+  ok "Сторож включён: упавшая сессия сама поднимется в течение 5 минут."
 
   # --- Таймер автоочистки простаивающих сессий (раз в сутки) ---
   say "Настраиваю автоочистку простаивающих сессий (>7 дней)…"
@@ -815,6 +1056,8 @@ EOF
   echo "   «какие сессии открыты»       → список + память"
   echo "   «дай ssh-команду к терминалу» → строка для входа в сессию с компьютера"
   echo " Папки проектов при закрытии НЕ удаляются. Переоткрыть: «открой проект shop»."
+  echo " Открытые сессии переживают перезагрузку и падения: возвращаются сами,"
+  echo " с продолжением прежнего диалога. Немедленно: ${C_INFO}claude-restore${C_RST}"
   echo "==============================================================="
 }
 
