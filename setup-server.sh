@@ -225,6 +225,38 @@ case "$TN" in
   cc-*)  disp="vps-${TN#cc-}";;
   *)     disp="$TN";;
 esac
+
+# Гасим docker-контейнеры проекта, но ТОЛЬКО когда закрывается его последняя
+# сессия — иначе закрытие одной сессии убьёт контейнеры, которыми ещё пользуется
+# вторая (у проекта бывает и главная, и побочная сессия сразу). Проект узнаём по
+# имени (ccp-<proj>) или по рабочей папке побочной сессии (/projects/<proj>).
+proj=""
+case "$TN" in
+  ccp-*) proj="${TN#ccp-}";;
+  cc-*)  d="$(tmux display-message -p -t "$TN" '#{pane_current_path}' 2>/dev/null || true)"
+         case "$d" in /projects/*) proj="${d#/projects/}"; proj="${proj%%/*}";; esac;;
+esac
+if [[ -n "$proj" && -d "/projects/$proj" ]] && command -v docker >/dev/null 2>&1; then
+  others=0
+  for s in $(tmux list-sessions -F '#S' 2>/dev/null || true); do
+    if [[ "$s" == "$TN" ]]; then continue; fi
+    if [[ "$s" == "ccp-$proj" ]]; then others=1; fi
+    if [[ "$s" == cc-* ]]; then
+      sd="$(tmux display-message -p -t "$s" '#{pane_current_path}' 2>/dev/null || true)"
+      if [[ "$sd" == "/projects/$proj" || "$sd" == "/projects/$proj/"* ]]; then others=1; fi
+    fi
+  done
+  if (( others == 0 )); then
+    cids="$(docker ps -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null || true)"
+    if [[ -n "$cids" ]]; then
+      echo "  Останавливаю контейнеры проекта '$proj' (закрывается его последняя сессия)…"
+      docker stop $cids >/dev/null 2>&1 || true
+    fi
+  else
+    echo "  Контейнеры '$proj' оставляю — у проекта есть ещё открытая сессия."
+  fi
+fi
+
 echo "✔ Сессия '$disp' закрывается… через пару секунд станет offline. Файлы на диске целы."
 ( sleep 2; tmux kill-session -t "$TN" 2>/dev/null ) &
 disown 2>/dev/null || true
