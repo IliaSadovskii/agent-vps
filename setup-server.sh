@@ -28,6 +28,10 @@
 
 set -euo pipefail
 
+# Папка репозитория — из неё берутся файлы, которые скрипт раскладывает
+# по серверу (skills/, templates/). Запуск из любого места.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # ------------------------- НАСТРОЙКИ -------------------------
 DEV_USER="dev"
 PROJECTS_DIR="/projects"
@@ -54,9 +58,14 @@ install_parallel_sessions() {
   install -d -o "$DEV_USER" -g "$DEV_USER" "$bin" "$skills"
 
   # ── СХЕМА ИМЁН СЕССИЙ ──────────────────────────────────────────────
-  #  vps-main (tmux: claude-ops) — глобальная управляющая, не закрывается
-  #  ccp-<имя> — ГЛАВНАЯ сессия проекта (claude-project); close-all бережёт
-  #  cc-<имя>  — ПОБОЧНАЯ (claude-new): временная управляющая или дочерняя
+  #  Внутри (tmux) имя говорит про ТИП сессии — от него зависит закрытие:
+  #    claude-ops — глобальная управляющая, не закрывается никогда
+  #    ccp-<имя>  — ГЛАВНАЯ сессия проекта (claude-project); close-all бережёт
+  #    cc-<имя>   — ПОБОЧНАЯ (claude-new): временная управляющая или дочерняя
+  #  Снаружи (в приложении) имя говорит про МЕСТО работы — считает claude-name:
+  #    vps-main, proj-<проект> — как и раньше
+  #    побочная в /projects/<проект> → тоже proj-* (proj-shop-2, proj-shop-debug)
+  #    побочная вне /projects       → vps-<имя>
   # ───────────────────────────────────────────────────────────────────
 
   # ── РЕЕСТР ОТКРЫТЫХ СЕССИЙ ─────────────────────────────────────────
@@ -107,6 +116,42 @@ case "$cmd" in
 esac
 REG_EOF
 
+  # claude-name — единственное место, где tmux-имя превращается в то, что
+  # видно в приложении. Побочная сессия в папке проекта — это сессия ЭТОГО
+  # проекта, поэтому она тоже proj-*: рядом с proj-shop вторая называется
+  # proj-shop-2, а не vps-shop-2. Тип (побочная/главная) по-прежнему живёт в
+  # tmux-префиксе (cc-/ccp-), от имени в приложении он не зависит.
+  cat > "$bin/claude-name" <<'NAME_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+TN="${1:-}"
+DIR="${2:-}"
+case "$TN" in
+  claude-ops|vps-main) echo "vps-main"; exit 0;;
+  ccp-*) echo "proj-${TN#ccp-}"; exit 0;;
+  cc-*)  SHORT="${TN#cc-}";;
+  *)     echo "$TN"; exit 0;;
+esac
+# Папка: аргумент → реестр (там записана папка запуска) → живая tmux-панель.
+if [[ -z "$DIR" ]]; then
+  DIR="$("$HOME/.local/bin/claude-registry" get "$TN" workdir 2>/dev/null || true)"
+fi
+if [[ -z "$DIR" ]]; then
+  DIR="$(tmux display-message -p -t "$TN" '#{pane_current_path}' 2>/dev/null || true)"
+fi
+PROJ=""
+case "$DIR" in
+  /projects/*) PROJ="${DIR#/projects/}"; PROJ="${PROJ%%/*}";;
+esac
+if [[ -z "$PROJ" ]]; then
+  echo "vps-$SHORT"
+elif [[ "$SHORT" == "$PROJ" || "$SHORT" == "$PROJ-"* ]]; then
+  echo "proj-$SHORT"          # имя уже начинается с проекта — не дублируем
+else
+  echo "proj-$PROJ-$SHORT"    # claude-new debug в /projects/shop → proj-shop-debug
+fi
+NAME_EOF
+
   # claude-new — ПОБОЧНАЯ сессия В ТЕКУЩЕЙ папке (наследует папку родителя).
   # Из vps-main (~/vps) → в ~/vps. Изнутри проекта → в папке проекта.
   # Второй аргумент — явная папка (папку нельзя передать через cd: скрипт
@@ -146,12 +191,13 @@ else
   WORKDIR="$OPS_DIR"
 fi
 [[ -x "$CLAUDE_BIN" ]] || CLAUDE_BIN="claude"
+DISP="$("$HOME/.local/bin/claude-name" "cc-$NAME" "$WORKDIR")"
 tmux new-session -d -s "cc-$NAME" -c "$WORKDIR" \
-  "$CLAUDE_BIN --dangerously-skip-permissions --remote-control --name vps-$NAME"
+  "$CLAUDE_BIN --dangerously-skip-permissions --remote-control --name $DISP"
 sleep 2
 if tmux has-session -t "cc-$NAME" 2>/dev/null; then
   "$HOME/.local/bin/claude-registry" add "cc-$NAME" "$WORKDIR" || true
-  echo "✔ Сессия 'vps-$NAME' (побочная) запущена в: $WORKDIR"
+  echo "✔ Сессия '$DISP' (побочная) запущена в: $WORKDIR"
   echo "  Закрыть: claude-close $NAME"
 else
   echo "✗ Не удалось запустить '$NAME'." >&2
@@ -245,10 +291,11 @@ while IFS= read -r line; do
         done
       done
       mb=$((mem / 1024))
+      disp="$("$HOME/.local/bin/claude-name" "$sname")"
       case "$sname" in
-        claude-ops) disp="vps-main (управление, не закрыть)";;
-        ccp-*)      disp="proj-${sname#ccp-} (главная проекта)";;
-        cc-*)       disp="vps-${sname#cc-} (побочная)";;
+        claude-ops) disp="$disp (управление, не закрыть)";;
+        ccp-*)      disp="$disp (главная проекта)";;
+        cc-*)       disp="$disp (побочная)";;
       esac
       printf "  • %-34s ~%s МБ\n" "$disp" "$mb"
       ;;
@@ -262,8 +309,8 @@ for tn in $("$HOME/.local/bin/claude-registry" list 2>/dev/null || true); do
   tmux has-session -t "$tn" 2>/dev/null && continue
   if [ "$pending" = "0" ]; then echo; echo "Упали, будут подняты автоматически:"; pending=1; fi
   case "$tn" in
-    ccp-*) echo "  • proj-${tn#ccp-} (главная проекта)";;
-    cc-*)  echo "  • vps-${tn#cc-} (побочная)";;
+    ccp-*) echo "  • $("$HOME/.local/bin/claude-name" "$tn") (главная проекта)";;
+    cc-*)  echo "  • $("$HOME/.local/bin/claude-name" "$tn") (побочная)";;
   esac
 done
 [ "$pending" = "1" ] && echo "  Поднять прямо сейчас: claude-restore"
@@ -294,11 +341,8 @@ if [[ "$TN" == "claude-ops" || "$TN" == "vps-main" ]]; then
   exit 1
 fi
 tmux has-session -t "$TN" 2>/dev/null || { echo "Не найдена."; exit 0; }
-case "$TN" in
-  ccp-*) disp="proj-${TN#ccp-}";;
-  cc-*)  disp="vps-${TN#cc-}";;
-  *)     disp="$TN";;
-esac
+# Имя считаем ДО снятия с реестра — claude-name берёт папку оттуда.
+disp="$("$HOME/.local/bin/claude-name" "$TN")"
 
 # Гасим docker-контейнеры проекта, но ТОЛЬКО когда закрывается его последняя
 # сессия — иначе закрытие одной сессии убьёт контейнеры, которыми ещё пользуется
@@ -345,10 +389,11 @@ CLOSE_EOF
 set -euo pipefail
 n=0
 for s in $(tmux ls 2>/dev/null | cut -d: -f1 | grep '^cc-'); do
+  disp="$("$HOME/.local/bin/claude-name" "$s")"
   "$HOME/.local/bin/claude-registry" del "$s" || true
   ( sleep 2; tmux kill-session -t "$s" 2>/dev/null ) &
   disown 2>/dev/null || true
-  echo "  закрываю побочную: vps-${s#cc-}"
+  echo "  закрываю побочную: $disp"
   n=$((n+1))
 done
 if [ "$n" = 0 ]; then
@@ -364,11 +409,12 @@ CLOSEALL_EOF
 set -euo pipefail
 n=0
 for s in $(tmux ls 2>/dev/null | cut -d: -f1 | grep -E '^(cc-|ccp-)'); do
+  disp="$("$HOME/.local/bin/claude-name" "$s")"
   "$HOME/.local/bin/claude-registry" del "$s" || true
   ( sleep 2; tmux kill-session -t "$s" 2>/dev/null ) &
   disown 2>/dev/null || true
-  if [ "${s#ccp-}" != "$s" ]; then echo "  закрываю проект: proj-${s#ccp-}"
-  else echo "  закрываю побочную: vps-${s#cc-}"; fi
+  if [ "${s#ccp-}" != "$s" ]; then echo "  закрываю проект: $disp"
+  else echo "  закрываю побочную: $disp"; fi
   n=$((n+1))
 done
 if [ "$n" = 0 ]; then
@@ -411,12 +457,7 @@ get_ip() {
   [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && echo "$ip" || echo "<IP-сервера>"
 }
 IP="$(get_ip)"
-case "$TN" in
-  claude-ops) disp="vps-main";;
-  ccp-*) disp="proj-${TN#ccp-}";;
-  cc-*) disp="vps-${TN#cc-}";;
-  *) disp="$TN";;
-esac
+disp="$("$HOME/.local/bin/claude-name" "$TN")"
 echo "Подключение к терминалу сессии '$disp':"
 echo
 echo "  ssh $DEV_USER@$IP -t 'tmux attach -t $TN'"
@@ -488,12 +529,15 @@ for f in "$HOME"/.claude/sessions/*.json; do
   disp="$(jq -r '.name // empty' "$f" 2>/dev/null || true)"
   sid="$(jq -r '.sessionId // empty' "$f" 2>/dev/null || true)"
   [[ -n "$disp" && -n "$sid" ]] || continue
-  case "$disp" in
-    vps-main) continue ;;                 # основная, в реестре не числится
-    proj-*)   tn="ccp-${disp#proj-}" ;;
-    vps-*)    tn="cc-${disp#vps-}" ;;
-    *)        continue ;;
-  esac
+  [[ "$disp" == "vps-main" ]] && continue   # основная, в реестре не числится
+  # Обратное сопоставление «имя в приложении → tmux-имя» разбором не сделать:
+  # побочная сессия в папке проекта тоже зовётся proj-*. Идём от реестра и
+  # сравниваем с тем, что даёт claude-name.
+  tn=""
+  for cand in $("$REGISTRY" list); do
+    if [[ "$("$HOME/.local/bin/claude-name" "$cand")" == "$disp" ]]; then tn="$cand"; break; fi
+  done
+  [[ -n "$tn" ]] || continue
   "$REGISTRY" set-session "$tn" "$sid" 2>/dev/null || true
 done
 
@@ -510,9 +554,8 @@ for tn in $("$REGISTRY" list); do
   fi
 
   case "$tn" in
-    ccp-*) disp="proj-${tn#ccp-}" ;;
-    cc-*)  disp="vps-${tn#cc-}" ;;
-    *)     continue ;;
+    ccp-*|cc-*) disp="$("$HOME/.local/bin/claude-name" "$tn" "$wd")" ;;
+    *)          continue ;;
   esac
 
   # Страховка от цикла: если сессия падает сразу после подъёма, перестаём
@@ -569,109 +612,30 @@ exit 0
 RESTORE_EOF
 
   # ── СКИЛЛЫ ─────────────────────────────────────────────────────────
-  # Каждая возможность — отдельный скилл (папка + SKILL.md). Имя папки даёт
-  # слэш-команду (/vps-new и т.д.), а описание — срабатывание по обычному
-  # тексту. Тело скилла говорит агенту вызвать соответствующую CLI-утилиту.
-  # CLI-утилиты в ~/.local/bin остаются — скиллы их вызывают.
+  # Живут файлами в репозитории (skills/<имя>/SKILL.md) и раскладываются
+  # отсюда в ~/.claude/skills — общие для всех сессий этого VPS. Правишь
+  # скилл в репозитории, применяешь `sudo bash setup-server.sh --sessions`.
+  # Имя папки даёт слэш-команду (/vps-new), описание — срабатывание по
+  # обычному тексту, тело говорит агенту вызвать CLI-утилиту из ~/.local/bin.
+  local src="$SCRIPT_DIR/skills"
+  if [[ -d "$src" ]]; then
+    for d in "$src"/*/; do
+      [[ -f "$d/SKILL.md" ]] || continue
+      local sname; sname="$(basename "$d")"
+      install -d -o "$DEV_USER" -g "$DEV_USER" "$skills/$sname"
+      install -m 644 -o "$DEV_USER" -g "$DEV_USER" "$d/SKILL.md" "$skills/$sname/SKILL.md"
+    done
+    # Скилл, которого нет в репозитории, переезд не переживёт — говорим вслух.
+    for d in "$skills"/*/; do
+      [[ -d "$d" ]] || continue
+      local iname; iname="$(basename "$d")"
+      [[ -d "$src/$iname" ]] || warn "Скилл '$iname' есть на сервере, но не в репозитории — при переезде потеряется."
+    done
+  else
+    warn "Папки skills/ рядом со скриптом нет — скиллы не разложены."
+  fi
 
-  # /vps-new
-  install -d -o "$DEV_USER" -g "$DEV_USER" "$skills/vps-new"
-  cat > "$skills/vps-new/SKILL.md" <<'S_EOF'
----
-name: vps-new
-description: Создать новую ПОБОЧНУЮ Claude-сессию на этом VPS в текущей папке. Используй, когда пользователь просит создать новую или параллельную сессию, поработать над задачей отдельно ("создай сессию для X", "новая сессия под отладку", "хочу параллельно заняться Y"). Слэш-команда /vps-new.
----
-Создай побочную сессию командой `claude-new <имя> [папка]`.
-1. Определи короткое латинское имя из запроса (отладка→debug, платежи→payments). Если пользователь назвал — используй его.
-2. Выполни `claude-new <имя>`. Сессия появится в приложении как `vps-<имя>` в текущей папке.
-3. Сообщи, что сессия создана и видна в приложении (раздел Code).
-Если просят вторую (параллельную) сессию для уже открытого проекта — передай папку
-вторым аргументом: `claude-new <имя> /projects/<проект>`. Через `cd` папку задать
-нельзя: без аргумента команда берёт папку tmux-панели родителя, а не cwd оболочки.
-НЕ создавай сессию, если пользователь просто хочет очистить контекст — для этого /clear.
-S_EOF
-
-  # /vps-project
-  install -d -o "$DEV_USER" -g "$DEV_USER" "$skills/vps-project"
-  cat > "$skills/vps-project/SKILL.md" <<'S_EOF'
----
-name: vps-project
-description: Создать или переоткрыть ПРОЕКТ на этом VPS (главная сессия проекта в /projects), опционально склонировав GitHub-репозиторий. Используй, когда пользователь просит создать проект, завести проект под что-то, открыть или вернуться к проекту ("создай проект shop", "заведи проект под магазин", "открой проект X"). Слэш-команда /vps-project.
----
-Создай/переоткрой проект командой `claude-project <имя> [github-url]`.
-
-Если пользователь дал и имя, и ссылку сразу («создай проект shop из github.com/me/shop») — сразу выполни `claude-project shop https://github.com/me/shop`.
-
-Если деталей нет — ВЕДИ ДИАЛОГ, собери СНАЧАЛА обе вещи, ПОТОМ вызови команду ОДИН раз. НЕ создавай проект, получив только имя: если создать сессию до клонирования, скиллы из репозитория не загрузятся.
-1. Спроси: «Как назвать проект?» — дождись, преобразуй в латинское имя.
-2. Спроси: «Есть GitHub-репозиторий? Пришли ссылку — склонирую сразу. Или "нет" — создам пустой.» — дождись ответа.
-3. Теперь вызови: со ссылкой → `claude-project <имя> <url>`; без → `claude-project <имя>`.
-4. Сообщи результат: проект создан/склонирован, сессия proj-<имя> в приложении.
-
-Переоткрытие существующего проекта — та же команда `claude-project <имя>` (код на диске цел).
-Если скилл/команда из репозитория не видны (репо склонировали в живую сессию) → `/reload-skills`; если не помогло — переоткрой проект (claude-close <имя> → claude-project <имя>).
-S_EOF
-
-  # /vps-sessions
-  install -d -o "$DEV_USER" -g "$DEV_USER" "$skills/vps-sessions"
-  cat > "$skills/vps-sessions/SKILL.md" <<'S_EOF'
----
-name: vps-sessions
-description: Показать список живых Claude-сессий на этом VPS и сколько памяти каждая занимает. Используй, когда пользователь спрашивает, какие сессии открыты, сколько их, сколько памяти они едят ("какие сессии открыты", "покажи сессии", "сколько памяти жрут сессии"). Слэш-команда /vps-sessions.
----
-Выполни `claude-list` и покажи пользователю результат — список сессий с памятью каждой.
-
-Если в выводе есть блок «Упали, будут подняты автоматически» — это сессии, чей процесс
-умер (обычно OOM), а карточка в приложении осталась висеть. Скажи об этом и предложи
-поднять сразу: `claude-restore` (иначе сторож сделает это сам в течение 5 минут).
-Причину падения видно в `journalctl -b -1 | grep -i oom` и `journalctl --user -u claude-restore -e`.
-S_EOF
-
-  # /vps-close
-  install -d -o "$DEV_USER" -g "$DEV_USER" "$skills/vps-close"
-  cat > "$skills/vps-close/SKILL.md" <<'S_EOF'
----
-name: vps-close
-description: Закрыть Claude-сессию на этом VPS — текущую или названную. Используй, когда пользователь просит закрыть сессию, завершить текущую сессию, закрыть конкретную сессию по имени ("закройся", "заверши эту сессию", "закрой сессию payments"). Слэш-команда /vps-close.
----
-Закрой сессию командой `claude-close [имя]`.
-- «закройся» / «заверши эту сессию» (без имени) → `claude-close` без аргумента (закроет текущую). Предупреди: сессия закроется через пару секунд, станет offline в приложении. НЕ делай этого в основной сессии vps-main.
-- «закрой сессию X» → `claude-close X`.
-Закрытие не удаляет файлы — только выгружает процесс. Проект переоткрывается через vps-project.
-S_EOF
-
-  # /vps-close-all
-  install -d -o "$DEV_USER" -g "$DEV_USER" "$skills/vps-close-all"
-  cat > "$skills/vps-close-all/SKILL.md" <<'S_EOF'
----
-name: vps-close-all
-description: Закрыть все ПОБОЧНЫЕ Claude-сессии на этом VPS, сохранив главные сессии проектов и vps-main. Используй, когда пользователь просит закрыть лишние или побочные сессии, прибрать ("закрой лишние сессии", "закрой побочные", "прибери сессии"). Слэш-команда /vps-close-all.
----
-Выполни `claude-close-all` — закроет побочные (vps-*) сессии. Главные сессии проектов (proj-*) и vps-main остаются. Сообщи, сколько закрыто.
-S_EOF
-
-  # /vps-close-everything
-  install -d -o "$DEV_USER" -g "$DEV_USER" "$skills/vps-close-everything"
-  cat > "$skills/vps-close-everything/SKILL.md" <<'S_EOF'
----
-name: vps-close-everything
-description: Закрыть ВСЕ Claude-сессии на этом VPS (побочные и проектные), кроме управляющей vps-main. Используй, когда пользователь просит закрыть вообще всё, выгрузить все проекты, освободить сервер полностью ("закрой вообще всё", "выгрузи все проекты тоже", "закрой все сессии включая проекты"). Слэш-команда /vps-close-everything.
----
-Выполни `claude-close-everything` — закроет всё, кроме vps-main. Папки проектов на диске целы, переоткрываются через vps-project. Сообщи результат.
-S_EOF
-
-  # /vps-ssh
-  install -d -o "$DEV_USER" -g "$DEV_USER" "$skills/vps-ssh"
-  cat > "$skills/vps-ssh/SKILL.md" <<'S_EOF'
----
-name: vps-ssh
-description: Показать готовую команду для подключения к терминалу Claude-сессии с компьютера по SSH. Используй, когда пользователь хочет подключиться к терминалу сессии, зайти в неё через SSH, получить команду прямого подключения ("дай ssh-команду", "как подключиться к терминалу этой сессии", "хочу зайти в терминал"). Слэш-команда /vps-ssh.
----
-Выполни `claude-ssh [имя]` (без имени — текущая сессия; `main` — основная; имя проекта/побочной — конкретная). Покажи пользователю готовую строку `ssh …`, которую он скопирует в терминал компьютера. Объясни: это подключит к той же живой сессии в полноценном терминале.
-S_EOF
-
-
-  chmod +x "$bin/claude-new" "$bin/claude-project" "$bin/claude-list" "$bin/claude-close" "$bin/claude-close-all" "$bin/claude-close-everything" "$bin/claude-ssh" "$bin/claude-cleanup" "$bin/claude-registry" "$bin/claude-restore"
+  chmod +x "$bin/claude-name" "$bin/claude-new" "$bin/claude-project" "$bin/claude-list" "$bin/claude-close" "$bin/claude-close-all" "$bin/claude-close-everything" "$bin/claude-ssh" "$bin/claude-cleanup" "$bin/claude-registry" "$bin/claude-restore"
   chown -R "$DEV_USER:$DEV_USER" "$home/.local" "$home/.claude"
 }
 
