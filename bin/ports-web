@@ -158,7 +158,16 @@ if proxy_running; then
       echo "	@fingerprinted path_regexp $fingerprint"
       echo "	header @fingerprinted Cache-Control \"public, max-age=31536000, immutable\""
       echo "	header X-Vps-Proxy \"$p\""
-      echo "	reverse_proxy 127.0.0.1:$p"
+      # X-Forwarded-Proto приходится задавать явно. По этому заголовку приложение
+      # строит абсолютные ссылки на себя, и tailscale присылает сюда https —
+      # но Caddy подменяет его СВОЕЙ схемой, а до него идёт локальный http.
+      # Приложение начинает верстать ссылки на http://…:8050, которого в tailnet
+      # нет (там только TLS), и страница остаётся без стилей.
+      # Схема здесь всегда https: единственный вход на сервис — tailscale,
+      # а TLS терминирует он.
+      echo "	reverse_proxy 127.0.0.1:$p {"
+      echo "		header_up X-Forwarded-Proto https"
+      echo "	}"
       echo "}"
     done
   } > "$cfnew"
