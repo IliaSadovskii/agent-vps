@@ -9,10 +9,15 @@
 #     делит их на веб и внутренние (postgres/mysql/redis… → внутренний, наружу
 #     не отдаётся). По образу, а не HTTP-пробой: проба капризна на медленных
 #     приложениях, образ детерминирован.
-#  2. Каждый веб-сервис отдаёт в tailnet НА ТОМ ЖЕ НОМЕРЕ порта (tailnet :8050 →
-#     host :8050) — один номер на сервис, совпадает с `ports map`. Serve правится
-#     по дельте (только при изменении состава), появившиеся/ушедшие подхватывает.
-#  3. Генерит index.html со ссылками на все сервисы, сгруппированные по проектам,
+#  2. Пишет конфиг общему прокси vps-proxy: на каждый веб-сервис — теневой порт
+#     (80XY + 1000 = 90XY), который сжимает ответы и проставляет Cache-Control
+#     на статику с хэшем в имени. Контейнер поднимает setup-dev.sh (step_proxy).
+#  3. Каждый веб-сервис отдаёт в tailnet НА ТОМ ЖЕ НОМЕРЕ порта (tailnet :8050 →
+#     host :8050) — один номер на сервис, совпадает с `ports map`. Целью ставит
+#     теневой порт прокси, если тот слушает, иначе — сам сервис напрямую. Serve
+#     правится по дельте (сверяются и состав, и цель), появившиеся/ушедшие
+#     подхватывает.
+#  4. Генерит index.html со ссылками на все сервисы, сгруппированные по проектам,
 #     и отдаёт его в tailnet на :8062. Страница сама обновляется (мета-рефреш) и
 #     перегенерируется по таймеру — всегда актуальна.
 set -uo pipefail
@@ -20,6 +25,10 @@ set -uo pipefail
 PORTS_DIR="${PORTS_DIR:-$HOME/vps/ports}"
 STATE_DIR="${STATE_DIR:-$HOME/.local/state/ports-web}"
 DASH_PORT=8062
+PROXY_NAME="${PROXY_NAME:-vps-proxy}"
+PROXY_DIR="${PROXY_DIR:-$HOME/.local/state/vps-proxy}"
+PROXY_OFFSET=1000                    # порт сервиса 80XY → теневой порт прокси 90XY
+PROXY_HEALTH=/_vps-proxy/health      # эту точку отвечает сам прокси, не приложение
 mkdir -p "$STATE_DIR"
 
 dnsname="$(tailscale status --json 2>/dev/null | grep -m1 '"DNSName"' | cut -d'"' -f4 | sed 's/\.$//')"
@@ -91,36 +100,133 @@ rows+="$(printf '%s\x1f%s\x1f%s\x1f%s\x1f%s' "$DASH_PORT" "инфраструк�
 
 [[ -n "${DEBUG:-}" ]] && { echo "=== ROWS ===" >&2; printf '%s' "$rows" >&2; }
 
-# --- 1) tailscale serve: по одному https-порту на веб-сервис (tailnet :P → :P)
-# Желаемое множество веб-портов; цель у каждого детерминирована (proxy на тот же
-# порт; дашборд — статическая папка), поэтому сверяем только СОСТАВ портов и
-# трогаем serve лишь когда он изменился — без «моргания» на каждом тике таймера.
-declare -A want
+# --- веб-сервисы, которые надо отдать наружу -------------------------------
+web_ports=()
 while IFS=$'\x1f' read -r p group name desc web; do
-  [[ "$web" == 1 ]] || continue
-  want[$p]=1
+  [[ "$web" == 1 && "$p" != "$DASH_PORT" ]] && web_ports+=("$p")
 done <<<"$rows"
+
+# --- 1) конфиг общему прокси (сжатие + кэш статики) -------------------------
+# На каждый веб-сервис — блок на теневом порту. Прокси слушает только 127.0.0.1:
+# наружу его отдаёт tailscale, как и всё остальное.
+#
+# Кэш ставим ТОЛЬКО файлам с отпечатком в имени (app-C6yGb0eL.css) внутри папок
+# сборки — такое имя меняется вместе с содержимым, и год кэша безопасен. Всё
+# остальное не трогаем: на дев-сервере устаревший ответ дороже лишнего запроса.
+# Условие про папку и отпечаток — соглашение сборщиков, а не признак стека.
+proxy_running(){ [[ "$(docker inspect -f '{{.State.Running}}' "$PROXY_NAME" 2>/dev/null)" == "true" ]]; }
+
+if proxy_running; then
+  mkdir -p "$PROXY_DIR"
+  cf="$PROXY_DIR/Caddyfile"; cfnew="$cf.new"; cfdirty="$PROXY_DIR/.reload-failed"
+  # {8,} в Caddyfile съел бы разбор плейсхолдеров — те же 8 символов классом.
+  c='[A-Za-z0-9_-]'
+  fingerprint="(?i)/(build|assets|static|dist)/.*-$c$c$c$c$c$c$c$c*\.(js|mjs|css|woff2?|svg|png|jpe?g|webp|avif|gif|ico)$"
+  {
+    echo "# Сгенерирован ports-web — правки затрутся. Источник: bin/ports-web."
+    echo "{"
+    echo "	admin 127.0.0.1:2019"
+    echo "	auto_https off"
+    echo "}"
+    for p in "${web_ports[@]}"; do
+      echo
+      # Адрес без хоста — намеренно. Caddy разбирает адрес блока как «схема,
+      # ХОСТ, порт» и матчит запрос по Host; tailscale проксирует с исходным
+      # Host (dev-vps…ts.net:8050), под 127.0.0.1 он не подошёл бы, и снаружи
+      # приходил бы пустой ответ. Матчим любой Host, а слушаем только loopback —
+      # это разные вещи, за адрес отвечает bind ниже.
+      #
+      # Схема http обязательна: без неё Caddy поднимает порт как HTTPS и отвечает
+      # «Client sent an HTTP request to an HTTPS server» — TLS здесь ни к чему,
+      # его терминирует tailscale, а до прокси идёт локальный http.
+      echo "http://:$(( p + PROXY_OFFSET )) {"
+      echo "	bind 127.0.0.1"
+      # Признак «прокси жив и это наш блок». Отвечает сам Caddy, не приложение,
+      # поэтому проба не зависит от того, поднялось ли уже приложение.
+      echo "	respond $PROXY_HEALTH \"ok\" 200"
+      # Список типов перечислен явно, без text/*: под text/* попадает
+      # text/event-stream, а сжатие потока ломает живые логи (SSE).
+      echo "	encode zstd gzip {"
+      echo "		match {"
+      for ct in text/html text/plain text/css text/javascript text/xml \
+                application/json application/javascript application/x-javascript \
+                application/xml application/manifest+json image/svg+xml; do
+        echo "			header Content-Type $ct*"
+      done
+      echo "		}"
+      echo "	}"
+      echo "	@fingerprinted path_regexp $fingerprint"
+      echo "	header @fingerprinted Cache-Control \"public, max-age=31536000, immutable\""
+      echo "	header X-Vps-Proxy \"$p\""
+      echo "	reverse_proxy 127.0.0.1:$p"
+      echo "}"
+    done
+  } > "$cfnew"
+
+  if cmp -s "$cfnew" "$cf" && [[ ! -e "$cfdirty" ]]; then
+    rm -f "$cfnew"
+  else
+    mv "$cfnew" "$cf"
+    if docker exec "$PROXY_NAME" caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+      rm -f "$cfdirty"
+    else
+      # Конфиг не принят — прокси работает на старом. Ставим метку, чтобы
+      # следующий тик попробовал снова, и не переключаем serve вслепую:
+      # ниже цель выбирается по тому, слушает ли теневой порт на самом деле.
+      : > "$cfdirty"
+      echo "ports-web: vps-proxy не принял конфиг (docker logs $PROXY_NAME)" >&2
+    fi
+  fi
+fi
+
+# --- 2) tailscale serve: по одному https-порту на веб-сервис (tailnet :P → :P)
+# Номер порта в tailnet всегда равен номеру сервиса; меняется только ЦЕЛЬ:
+# теневой порт прокси, если тот отвечает, иначе сам сервис напрямую. Спрашиваем
+# у прокси его health-точку, а не просто «слушает ли порт»: конфиг мог не
+# примениться, блок — оказаться не наш. Не ответил — сервис остаётся доступен
+# напрямую, то есть худший исход поломки прокси это «медленно, как раньше».
+proxy_ok(){ [[ "$(curl -s -m 2 "http://127.0.0.1:$1$PROXY_HEALTH" 2>/dev/null)" == "ok" ]]; }
+declare -A want
+for p in "${web_ports[@]}"; do
+  sp=$(( p + PROXY_OFFSET ))
+  if proxy_running; then
+    # Свежий порт появляется в прокси через долю секунды после reload — ждём.
+    for _try in 1 2 3 4 5; do proxy_ok "$sp" && break; sleep 0.4; done
+  fi
+  if proxy_ok "$sp"; then want[$p]="http://127.0.0.1:$sp"; else want[$p]="http://127.0.0.1:$p"; fi
+done
+want[$DASH_PORT]="static"            # дашборд отдаёт сам tailscaled из папки
+
 # ports-web — единственный хозяин tailnet-serve: состав всегда приводится к
 # желаемому (веб-сервисы + дашборд), любое лишнее снимается. Само-исцеляется и
 # не «моргает»: в устоявшемся состоянии обе ветки — no-op (add/off не нужны).
-current="$(tailscale serve status --json 2>/dev/null | grep -oE '"[0-9]{4,5}":' | tr -dc '0-9\n' | sort -un)"
-# добавить недостающие. tailscale правит один конфиг, и пачка команд подряд
+serve_map(){ # "порт<TAB>цель", где цель — url прокси или "static" для папки
+  tailscale serve status --json 2>/dev/null | jq -r '
+    (.Web // {}) | to_entries[]
+    | (.key | split(":") | last) as $p
+    | (.value.Handlers["/"] // {}) as $h
+    | "\($p)\t\($h.Proxy // "static")"' 2>/dev/null
+}
+serve_tgt(){ serve_map | awk -F'\t' -v p="$1" '$1==p{print $2; exit}'; }
+
+# привести к желаемому. tailscale правит один конфиг, и пачка команд подряд
 # ловит гонку (часть молча не применяется) — поэтому проверяем и ретраим.
 for p in "${!want[@]}"; do
-  grep -qx "$p" <<<"$current" && continue
-  local_tgt="http://127.0.0.1:$p"; [[ "$p" == "$DASH_PORT" ]] && local_tgt="$STATE_DIR/"
+  tgt="${want[$p]}"
+  [[ "$(serve_tgt "$p")" == "$tgt" ]] && continue
+  arg="$tgt"; [[ "$tgt" == "static" ]] && arg="$STATE_DIR/"
   for _try in 1 2 3 4 5; do
-    tailscale serve status 2>/dev/null | grep -q "ts\.net:$p" && break
-    sudo -n tailscale serve --bg --https="$p" "$local_tgt" >/dev/null 2>&1
+    sudo -n tailscale serve --bg --https="$p" "$arg" >/dev/null 2>&1
     sleep 0.4
+    [[ "$(serve_tgt "$p")" == "$tgt" ]] && break
   done
 done
-# снять всё, чего в желаемом нет (старые 844x, ушедшие проекты)
-for p in $current; do
-  [[ -n "${want[$p]:-}" ]] || sudo -n tailscale serve --https="$p" off >/dev/null 2>&1
-done
+# снять всё, чего в желаемом нет (ушедшие проекты, старые схемы)
+while IFS=$'\t' read -r p _; do
+  [[ -n "$p" && -z "${want[$p]:-}" ]] && sudo -n tailscale serve --https="$p" off >/dev/null 2>&1
+done < <(serve_map)
 
-# --- 2) дашборд index.html --------------------------------------------------
+# --- 3) дашборд index.html --------------------------------------------------
 esc(){ sed -e 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
 html="$STATE_DIR/index.html.tmp"
 {
