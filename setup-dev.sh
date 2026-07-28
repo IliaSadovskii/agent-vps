@@ -25,6 +25,7 @@ set -euo pipefail
 PROJECTS_DIR="/projects"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORTS_DIR="$REPO_DIR/ports"          # ports/<имя>.env — блок портов проекта
+CONF_FILE="$REPO_DIR/vps.conf"       # настройки сервера (язык агентов и т.п.)
 # -------------------------------------------------------------
 
 C_OK=$'\e[32m'; C_WARN=$'\e[33m'; C_ERR=$'\e[31m'; C_INFO=$'\e[36m'; C_RST=$'\e[0m'
@@ -731,6 +732,72 @@ UNIT
 # ============================================================================
 #  ПРАВИЛА ДЛЯ АГЕНТОВ
 # ============================================================================
+# ============================================================================
+#  ЯЗЫК ОБЩЕНИЯ АГЕНТОВ
+# ============================================================================
+# Русский в этом репозитории — язык документов, а не приказ отвечать по-русски:
+# нигде нет директивы про язык, агент просто зеркалит то, что читает. Поэтому
+# язык ответа задаём явно, одной строкой в ~/.claude/CLAUDE.md — его Claude Code
+# читает в КАЖДОЙ сессии этого пользователя, и управляющей, и проектной. Так
+# сервер становится многоязычным без перевода правил и скиллов.
+step_agent_lang() {
+  echo; say "═══ Язык общения агентов ═══"
+
+  local lang="ru"
+  if [[ -f "$CONF_FILE" ]]; then
+    local v
+    v="$(grep -E '^[[:space:]]*AGENT_LANG=' "$CONF_FILE" | tail -1 | cut -d= -f2- \
+         | tr -d '"'"'" | sed 's/[[:space:]]*$//; s/^[[:space:]]*//')"
+    [[ -n "$v" ]] && lang="$v"
+  fi
+  # Значение попадает в файл, который читает агент, — пускаем только язык.
+  if ! [[ "$lang" =~ ^[A-Za-z][A-Za-z\ -]{0,30}$ ]]; then
+    warn "AGENT_LANG='$lang' не похож на язык — оставляю русский. Примеры: ru, en, Spanish."
+    lang="ru"
+  fi
+
+  local line note
+  case "${lang,,}" in
+    ru|rus|russian)
+      line="Общайся с пользователем по-русски."
+      note="Отвечай так независимо от того, на каком языке написаны файлы, которые читаешь." ;;
+    en|eng|english)
+      line="Talk to the user in English."
+      note="Answer in that language regardless of the language of the files you read." ;;
+    *)
+      line="Talk to the user in $lang."
+      note="Answer in that language regardless of the language of the files you read." ;;
+  esac
+
+  local f="$HOME/.claude/CLAUDE.md"
+  local begin="<!-- vps:lang — генерируется setup-dev.sh из vps.conf, правь там -->"
+  local end="<!-- /vps:lang -->"
+  install -d -m 700 "$HOME/.claude"
+  [[ -f "$f" ]] || : > "$f"
+
+  # Блок с маркерами, а не весь файл: рядом могут лежать личные заметки
+  # пользователя, и перезаписывать их платформа права не имеет.
+  local tmp="$f.tmp"
+  if grep -qF "$begin" "$f" && grep -qF "$end" "$f"; then
+    awk -v b="$begin" -v e="$end" -v l="$line" -v n="$note" '
+      $0 == b { print b; print l; print n; print e; skip = 1; next }
+      skip && $0 == e { skip = 0; next }
+      !skip { print }
+    ' "$f" > "$tmp"
+  else
+    { cat "$f"; [[ -s "$f" ]] && echo; printf '%s\n%s\n%s\n%s\n' "$begin" "$line" "$note" "$end"; } > "$tmp"
+  fi
+
+  if cmp -s "$f" "$tmp"; then
+    rm -f "$tmp"
+    skip "Язык агентов: $lang"
+  else
+    mv "$tmp" "$f"
+    ok "Язык агентов: $lang (записано в $f)."
+    say "Уже открытые сессии читают правила только при старте — переоткрой их, если нужно сразу."
+  fi
+}
+
 step_rules() {
   echo; say "═══ Правила для агентов ═══"
 
@@ -766,6 +833,7 @@ main() {
   step_ports
   step_dashboard
   step_autopull
+  step_agent_lang
   step_rules
 
   echo

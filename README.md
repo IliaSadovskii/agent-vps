@@ -5,7 +5,8 @@ develop your projects. Sessions survive reboots and crashes, and are reachable f
 app and over SSH. Projects run in docker and are never exposed to the internet.
 
 One control session maintains the server; every project gets its own session in its own folder.
-The scripts and the agents speak Russian — this README is the English overview.
+The repo's own docs are written in Russian — this README is the English overview — but the
+language agents **talk to you** in is a setting, see [Language](#language).
 
 ## Install
 
@@ -108,6 +109,21 @@ separately. Closing by hand deregisters the session, so what you closed stays cl
 session dies 3 times in an hour the watchdog stops reviving it (`journalctl --user -u
 claude-restore -e`), and it never starts anything when less than 800 MB is free.
 
+## Language
+
+Nothing on this server orders agents to speak Russian — they simply mirror the language of what
+they read, and the rules and skills happen to be Russian. So the reply language is set
+explicitly, in `vps.conf`:
+
+```bash
+AGENT_LANG=en     # ru, en, or a language name in English: Spanish, Japanese
+bash init.sh      # writes the directive into ~/.claude/CLAUDE.md, read by every session
+```
+
+Rules, skills and command output stay Russian — translating them is not what makes the server
+multilingual; one explicit line is. The file is only read at session start, so reopen a session
+to apply the change (or just ask the agent to switch for this conversation).
+
 ## Network and security
 
 - Only **SSH** is reachable from the internet, plus `41641/udp` for direct Tailscale
@@ -150,6 +166,7 @@ volumes, rebuilt by migrations and seeds).
 
 ```
 ~/vps/                     this repo: scripts, port registry, skills, contract.
+       vps.conf            server settings (agent language)
        bin/                ports, ports-web — installed into ~/.local/bin
        skills/             slash commands — deployed to ~/.claude/skills
        ports/              a block of ten ports per project
