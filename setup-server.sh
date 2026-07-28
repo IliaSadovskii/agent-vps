@@ -475,17 +475,25 @@ set -euo pipefail
 MAX_IDLE_DAYS="${MAX_IDLE_DAYS:-7}"
 now=$(date +%s)
 max_idle=$(( MAX_IDLE_DAYS * 86400 ))
-tmux ls 2>/dev/null | cut -d: -f1 | grep '^cc-' | while read -r sname; do
+# Список берём ЗАРАНЕЕ и с `|| true`: под `set -euo pipefail` grep без единого
+# совпадения возвращает 1 и роняет весь скрипт. «Побочных сессий нет» — обычное
+# состояние сервера, а служба из-за этого падала каждые сутки.
+sessions="$(tmux ls -F '#S' 2>/dev/null | grep '^cc-' || true)"
+[[ -n "$sessions" ]] || exit 0
+while read -r sname; do
+  [[ -n "$sname" ]] || continue
   last=$(tmux list-windows -t "$sname" -F '#{window_activity}' 2>/dev/null | sort -n | tail -1)
   [ -z "$last" ] && continue
   idle=$(( now - last ))
   if [ "$idle" -gt "$max_idle" ]; then
-    echo "$(date '+%F %T') автоочистка: закрываю '$sname' (простой $((idle/86400)) дн)"
+    # Имя для журнала считаем ДО снятия с реестра — claude-name берёт оттуда папку.
+    disp="$("$HOME/.local/bin/claude-name" "$sname" 2>/dev/null || echo "$sname")"
+    echo "$(date '+%F %T') автоочистка: закрываю '$disp' (простой $((idle/86400)) дн)"
     # Снять с реестра обязательно — иначе сторож поднимет её обратно через 5 минут.
     "$HOME/.local/bin/claude-registry" del "$sname" 2>/dev/null || true
     tmux kill-session -t "$sname" 2>/dev/null || true
   fi
-done
+done <<< "$sessions"
 CLEANUP_EOF
 
   # claude-restore — поднимает сессии из реестра, которых нет в живых.
