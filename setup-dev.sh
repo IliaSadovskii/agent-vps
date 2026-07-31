@@ -866,6 +866,59 @@ step_agent_lang() {
   fi
 }
 
+# ============================================================================
+#  ПЛАГИНЫ АГЕНТОВ — общие для всех сессий сервера
+# ============================================================================
+# Ставятся на уровень пользователя (scope: user), то есть действуют в каждой
+# сессии — и управляющей, и проектной. Список — в vps.conf: плагин меняет то,
+# как агент разговаривает и что умеет, это настройка сервера, а не код скрипта.
+step_plugins() {
+  echo; say "═══ Плагины агентов ═══"
+
+  local list="" v
+  if [[ -f "$CONF_FILE" ]]; then
+    v="$(grep -E '^[[:space:]]*AGENT_PLUGINS=' "$CONF_FILE" | tail -1 | cut -d= -f2- \
+         | tr -d '"'"'" | sed 's/[[:space:]]*$//; s/^[[:space:]]*//')"
+    [[ -n "$v" ]] && list="$v"
+  fi
+  [[ -n "$list" ]] || { skip "Плагины не заданы (AGENT_PLUGINS в vps.conf)"; return 0; }
+
+  local cli="$HOME/.local/bin/claude"
+  [[ -x "$cli" ]] || cli="$(command -v claude 2>/dev/null || true)"
+  [[ -n "$cli" ]] || { warn "Claude Code не найден — пропускаю плагины."; return 0; }
+
+  local installed entry name repo
+  installed="$("$cli" plugin list 2>/dev/null || true)"
+
+  for entry in $list; do
+    name="${entry%%=*}"    # caveman@caveman
+    repo="${entry#*=}"     # JuliusBrussee/caveman
+    # Обе части уходят в командную строку — пускаем только безобидные символы.
+    if ! [[ "$name" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$ ]] \
+       || ! [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+      warn "AGENT_PLUGINS: '$entry' не в формате плагин@маркетплейс=владелец/репо — пропускаю."
+      continue
+    fi
+
+    if grep -qF "$name" <<<"$installed"; then
+      skip "Плагин $name"
+      continue
+    fi
+
+    say "Ставлю плагин $name из $repo…"
+    # Маркетплейс и плагин — два шага, и первый безопасно повторять.
+    # Сеть может быть недоступна: это не повод валить всю настройку сервера.
+    if "$cli" plugin marketplace add "$repo" >/dev/null 2>&1 \
+       && "$cli" plugin install "$name" >/dev/null 2>&1; then
+      ok "Плагин $name установлен (для всех сессий)."
+    else
+      warn "Не удалось поставить $name — проверь сеть и '$cli plugin marketplace add $repo'."
+    fi
+  done
+
+  say "Плагин действует в сессиях, открытых ПОСЛЕ установки — прежние переоткрой."
+}
+
 step_rules() {
   echo; say "═══ Правила для агентов ═══"
 
@@ -903,6 +956,7 @@ main() {
   step_dashboard
   step_autopull
   step_agent_lang
+  step_plugins
   step_rules
 
   echo

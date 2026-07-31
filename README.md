@@ -124,6 +124,18 @@ Rules, skills and command output stay Russian — translating them is not what m
 multilingual; one explicit line is. The file is only read at session start, so reopen a session
 to apply the change (or just ask the agent to switch for this conversation).
 
+## Agent plugins
+
+`AGENT_PLUGINS` in `vps.conf` lists Claude Code plugins installed for **every** session on the
+server, control and project alike (`plugin@marketplace=owner/repo`, space-separated). The default
+is [caveman](https://github.com/JuliusBrussee/caveman) — it strips filler, hedging and repeated
+confirmations from replies. Its own [honest numbers](https://github.com/JuliusBrussee/caveman/blob/main/docs/HONEST-NUMBERS.md):
+~65% shorter output, but the rules cost ~1-1.5k input tokens per turn, so on short exchanges it
+costs more than it saves. The real win is reading speed. Turn it off for a while without touching
+the config: `claude plugin disable caveman@caveman`.
+
+Plugins are read at session start — reopen a session for a change to reach it.
+
 ## Network and security
 
 - Only **SSH** is reachable from the internet, plus `41641/udp` for direct Tailscale
